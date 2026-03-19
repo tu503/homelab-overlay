@@ -270,15 +270,19 @@ src_unpack() {
 
 src_prepare() {
 	if use system-boost; then
-		rm -r src/boost || die # ensure use system boost, reduce QA spam
+		# git-r3 may not clone the boost submodule
+		[[ -d src/boost ]] && { rm -r src/boost || die; }
 	fi
 
 	# ensure system-libs, reduce QA spam (FIXME: fails w/o zstd subdir)
-	rm -r src/{c-ares,jaegertracing/opentelemetry-cpp,rocksdb,utf8proc} || die
+	local d
+	for d in c-ares jaegertracing/opentelemetry-cpp rocksdb utf8proc; do
+		[[ -d "src/${d}" ]] && { rm -r "src/${d}" || die; }
+	done
 
 	if use parquet; then
 		# hammer in newer version of parquet/arrow
-		rm -r src/arrow/ || die
+		[[ -d src/arrow ]] && { rm -r src/arrow/ || die; }
 		mv "${WORKDIR}/apache-arrow-17.0.0" src/arrow || die
 	fi
 
