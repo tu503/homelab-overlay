@@ -1,0 +1,59 @@
+--- a/src/pybind/mgr/prometheus/module.py	2026-03-19 12:44:24.650312363 -0400
++++ b/src/pybind/mgr/prometheus/module.py	2026-03-19 12:44:35.856979234 -0400
+@@ -1891,7 +1891,7 @@
+                     self.setup_tls_config(server_addr, server_port)
+                     return
+             except Exception as e:
+-                self.log.exception(f'Failed to setup cephadm based secure monitoring stack: {e}\n',
++                self.log.exception(f'Failed to setup cephadm based secure monitoring stack: {e}\n'
+                                    'Falling back to default configuration')
+ 
+         # In any error fallback to plain http mode
+
+--- a/src/pybind/mgr/mgr_util.py	2026-03-19 12:44:24.650312363 -0400
++++ b/src/pybind/mgr/mgr_util.py	2026-03-19 12:44:56.956979618 -0400
+@@ -670,7 +670,14 @@
+ 
+ def verify_cacrt_content(crt):
+     # type: (str) -> int
+-    from OpenSSL import crypto
++    try:
++        from OpenSSL import crypto
++    except ImportError:
++        # PyO3/cryptography incompatible with Python subinterpreters (3.13+).
++        # Fall back to basic PEM validation.
++        if not crt or '-----BEGIN CERTIFICATE-----' not in crt:
++            raise ServerConfigException('Invalid certificate: cannot parse PEM data')
++        return 0
+     try:
+         crt_buffer = crt.encode("ascii") if isinstance(crt, str) else crt
+         x509 = crypto.load_certificate(crypto.FILETYPE_PEM, crt_buffer)
+@@ -780,12 +787,26 @@
+     if not cert_fname or not pkey_fname:
+         raise ServerConfigException('no certificate configured')
+ 
+-    verify_cacrt(cert_fname)
++    try:
++        verify_cacrt(cert_fname)
++    except ServerConfigException:
++        raise
++    except ImportError:
++        # PyO3/cryptography incompatible with Python subinterpreters (3.13+).
++        if not os.path.isfile(cert_fname):
++            raise ServerConfigException(
++                "Certificate {} does not exist".format(cert_fname))
++        logger.warning(
++            "Could not import OpenSSL for full TLS validation "
++            "(PyO3 subinterpreter limitation); using basic file checks only")
+ 
+     if not os.path.isfile(pkey_fname):
+         raise ServerConfigException('private key %s does not exist' % pkey_fname)
+ 
+-    from OpenSSL import crypto, SSL
++    try:
++        from OpenSSL import crypto, SSL
++    except ImportError:
++        return
+ 
+     try:
+         with open(pkey_fname) as f:

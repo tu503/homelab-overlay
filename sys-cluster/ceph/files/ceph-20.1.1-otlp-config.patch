@@ -1,0 +1,28 @@
+--- a/src/common/options/global.yaml.in	2026-03-19 14:08:37.820404440 -0400
++++ b/src/common/options/global.yaml.in	2026-03-19 14:09:15.107071787 -0400
+@@ -6882,11 +6882,24 @@
+ - name: jaeger_agent_port
+   type: int
+   level: advanced
+-  desc: TCP port number of the Jaeger agent
++  desc: TCP port number of the Jaeger agent (legacy, prefer otel_tracing_endpoint)
+   default: 6799
+   services:
+   - rgw
+   - osd
++- name: otel_tracing_endpoint
++  type: str
++  level: advanced
++  desc: OTLP HTTP exporter endpoint (host:port or full URL)
++  long_desc: >-
++    Endpoint for the OTLP HTTP exporter. Can be a host:port pair
++    (http:// and /v1/traces are appended automatically) or a full URL.
++    Examples: localhost:4318, http://jaeger.monitoring:4318/v1/traces
++  default: localhost:4318
++  services:
++  - rgw
++  - osd
++  with_legacy: true
+ - name: mgr_ttl_cache_expire_seconds
+   type: uint
+   level: dev
