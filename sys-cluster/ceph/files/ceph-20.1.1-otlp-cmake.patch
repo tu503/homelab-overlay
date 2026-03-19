@@ -1,8 +1,10 @@
---- a/src/CMakeLists.txt	2026-03-19 14:08:37.823737773 -0400
-+++ b/src/CMakeLists.txt	2026-03-19 16:23:59.993885166 -0400
-@@ -390,13 +390,21 @@
-     IMPORTED_LINK_INTERFACE_LANGUAGES "CXX")
- endif(WITH_BREAKPAD)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index a0e8c583ab5..0be5e2584ca 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -317,13 +317,23 @@ if (WITH_BLKIN)
+   add_subdirectory(blkin/blkin-lib)
+ endif(WITH_BLKIN)
  
 +option(WITH_SYSTEM_OPENTELEMETRY "build against system opentelemetry" OFF)
  if(WITH_JAEGER)
@@ -20,9 +22,11 @@
 +      opentelemetry-cpp::otlp_http_exporter
 +      opentelemetry-cpp::common)
 +  else()
++    find_package(thrift 0.13.0 REQUIRED)
 +    include(BuildOpentelemetry)
 +    build_opentelemetry()
-+    target_link_libraries(jaeger_base INTERFACE opentelemetry::libopentelemetry)
++    target_link_libraries(jaeger_base INTERFACE opentelemetry::libopentelemetry
++      thrift::libthrift)
 +  endif()
  endif()
  

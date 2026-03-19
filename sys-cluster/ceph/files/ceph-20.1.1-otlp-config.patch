@@ -1,11 +1,13 @@
---- a/src/common/options/global.yaml.in	2026-03-19 14:08:37.820404440 -0400
-+++ b/src/common/options/global.yaml.in	2026-03-19 14:09:15.107071787 -0400
-@@ -6882,11 +6882,24 @@
+diff --git a/src/common/options/global.yaml.in b/src/common/options/global.yaml.in
+index 5b7d589277c..832aca5e368 100644
+--- a/src/common/options/global.yaml.in
++++ b/src/common/options/global.yaml.in
+@@ -6764,11 +6764,24 @@ options:
  - name: jaeger_agent_port
    type: int
    level: advanced
--  desc: TCP port number of the Jaeger agent
-+  desc: TCP port number of the Jaeger agent (legacy, prefer otel_tracing_endpoint)
+-  desc: port number of the jaeger agent
++  desc: port number of the jaeger agent (legacy, prefer otel_tracing_endpoint)
    default: 6799
    services:
    - rgw

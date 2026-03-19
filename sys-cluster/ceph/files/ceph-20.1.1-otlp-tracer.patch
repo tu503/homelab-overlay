@@ -1,5 +1,7 @@
---- a/src/common/tracer.cc	2026-03-19 14:08:37.817071107 -0400
-+++ b/src/common/tracer.cc	2026-03-19 14:09:04.247071589 -0400
+diff --git a/src/common/tracer.cc b/src/common/tracer.cc
+index 6a84480d60b..29eb5ac24e6 100644
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
 @@ -8,7 +8,8 @@
  #ifdef HAVE_JAEGER
  #include "opentelemetry/sdk/trace/batch_span_processor.h"
@@ -10,7 +12,7 @@
  
  #define dout_subsys ceph_subsys_trace
  #undef dout_prefix
-@@ -26,13 +27,20 @@
+@@ -26,13 +27,20 @@ void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_n
    cct = _cct;
    if (!tracer) {
      ldout(cct, 3) << "tracer was not loaded, initializing tracing" << dendl;
