@@ -1,0 +1,53 @@
+From 636e1a607d1a4ba3bd11ecc8f6f785a8d883d727 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Mon, 23 Mar 2026 14:01:57 -0400
+Subject: [PATCH] rgw: propagate multipart trace context to RADOS data writes
+
+Fix cross-service trace linking for multipart uploads. Previously,
+RADOS data writes carried the ephemeral request trace context instead
+of the multipart upload trace context, causing OSD spans to appear
+under a separate trace ID from the multipart lifecycle spans.
+
+Also increase BatchSpanProcessor queue from 2048 to 16384 (8x) and
+export batch from 512 to 4096 to prevent span drops under load.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/tracer.cc | 4 +++-
+ src/rgw/rgw_op.cc    | 5 +++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/tracer.cc b/src/common/tracer.cc
+index c05adc24e33..0dd2ec81ea8 100644
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
+@@ -39,7 +39,9 @@ void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_n
+     }
+     ldout(cct, 3) << "OTLP HTTP exporter endpoint: " << exporter_options.url << dendl;
+     auto otlp_exporter = opentelemetry::exporter::otlp::OtlpHttpExporterFactory::Create(exporter_options);
+-    const opentelemetry::sdk::trace::BatchSpanProcessorOptions processor_options;
++    opentelemetry::sdk::trace::BatchSpanProcessorOptions processor_options;
++    processor_options.max_queue_size = 16384;
++    processor_options.max_export_batch_size = 4096;
+     opentelemetry::sdk::resource::ResourceAttributes res_attrs{{"service.name", service_name}};
+     if (!instance_id.empty()) {
+       res_attrs.SetAttribute("service.instance.id", instance_id);
+diff --git a/src/rgw/rgw_op.cc b/src/rgw/rgw_op.cc
+index 29fd54db457..fa434d9edfe 100644
+--- a/src/rgw/rgw_op.cc
++++ b/src/rgw/rgw_op.cc
+@@ -4458,6 +4458,11 @@ void RGWPutObj::execute(optional_yield y)
+ 
+     s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, multipart_upload_id);
+     multipart_trace = tracing::rgw::tracer.add_span(name(), upload->get_trace());
++    // propagate multipart trace context so RADOS data writes link to
++    // the multipart upload trace rather than the ephemeral request trace
++    if (multipart_trace && multipart_trace->IsRecording()) {
++      s->object->set_trace(multipart_trace->GetContext());
++    }
+ 
+     if (op_ret < 0) {
+       if (op_ret != -ENOENT) {
+-- 
+2.52.0
+
