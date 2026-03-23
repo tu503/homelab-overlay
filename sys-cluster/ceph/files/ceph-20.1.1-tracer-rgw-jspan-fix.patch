@@ -1,0 +1,39 @@
+From 656f0d3bcaf62dcb03d640fd21771ccfdbf207cc Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Thu, 19 Mar 2026 20:29:32 -0400
+Subject: [PATCH 03/10] tracer: fix jspan_context default construction in
+ rgw_tools
+
+SpanContext has no default constructor; use {false, false} for an
+invalid context when no trace_info is provided.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/rgw/driver/rados/rgw_tools.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/rgw/driver/rados/rgw_tools.cc b/src/rgw/driver/rados/rgw_tools.cc
+index fbbc5b7d1e1..1d191df08b4 100644
+--- a/src/rgw/driver/rados/rgw_tools.cc
++++ b/src/rgw/driver/rados/rgw_tools.cc
+@@ -234,7 +234,7 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+                       optional_yield y, int flags, const jspan_context* trace_info,
+                       version_t* pver)
+ {
+-  auto rados_span = tracing::rgw::tracer.add_span("rados_read", trace_info ? *trace_info : jspan_context());
++  auto rados_span = tracing::rgw::tracer.add_span("rados_read", trace_info ? *trace_info : jspan_context{false, false});
+   if (rados_span->IsRecording()) {
+     rados_span->SetAttribute("oid", oid);
+     rados_span->SetAttribute("pool", ioctx.get_pool_name());
+@@ -273,7 +273,7 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+                       librados::ObjectWriteOperation&& op, optional_yield y,
+ 		      int flags, const jspan_context* trace_info, version_t* pver)
+ {
+-  auto rados_span = tracing::rgw::tracer.add_span("rados_write", trace_info ? *trace_info : jspan_context());
++  auto rados_span = tracing::rgw::tracer.add_span("rados_write", trace_info ? *trace_info : jspan_context{false, false});
+   if (rados_span->IsRecording()) {
+     rados_span->SetAttribute("oid", oid);
+     rados_span->SetAttribute("pool", ioctx.get_pool_name());
+-- 
+2.52.0
+

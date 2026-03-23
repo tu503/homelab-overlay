@@ -1,0 +1,106 @@
+From a45c4ad7635f7757f28c81dcd3c82ce6efdde875 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 22:48:35 -0400
+Subject: [PATCH 09/10] bluestore: add bluestore-local tracer to fix
+ ceph-bluestore-tool link failure
+
+BlueStore.cc used tracing::osd::tracer which is defined in osd_tracer.o,
+part of the OSD library. ceph-bluestore-tool only links against the os
+library, causing an undefined reference at link time.
+
+Add a bluestore-specific tracer (tracing::bluestore::tracer) so the os
+library is self-contained and does not depend on OSD symbols.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/os/CMakeLists.txt                |  1 +
+ src/os/bluestore/BlueStore.cc        |  6 +++---
+ src/os/bluestore/bluestore_tracer.cc | 12 ++++++++++++
+ src/os/bluestore/bluestore_tracer.h  | 13 +++++++++++++
+ 4 files changed, 29 insertions(+), 3 deletions(-)
+ create mode 100644 src/os/bluestore/bluestore_tracer.cc
+ create mode 100644 src/os/bluestore/bluestore_tracer.h
+
+diff --git a/src/os/CMakeLists.txt b/src/os/CMakeLists.txt
+index 4a96f4290d6..3fe8572ec87 100644
+--- a/src/os/CMakeLists.txt
++++ b/src/os/CMakeLists.txt
+@@ -29,6 +29,7 @@ if(WITH_BLUESTORE)
+     bluestore/Writer.cc
+     bluestore/Compression.cc
+     bluestore/BlueAdmin.cc
++    bluestore/bluestore_tracer.cc
+   )
+ endif(WITH_BLUESTORE)
+ 
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index 030453ef875..57ef8827d10 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -60,7 +60,7 @@
+ #include "Writer.h"
+ #include "Compression.h"
+ #include "BlueAdmin.h"
+-#include "osd/osd_tracer.h"
++#include "bluestore_tracer.h"
+ #include "osd/OpRequest.h"
+ 
+ #if defined(WITH_LTTNG)
+@@ -14272,7 +14272,7 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+ #endif
+ 	txc->had_ios = true;
+ 	if (txc->otel_span && txc->otel_span->IsRecording()) {
+-	  txc->otel_aio_span = tracing::osd::tracer.add_span(
++	  txc->otel_aio_span = tracing::bluestore::tracer.add_span(
+ 	    "txc_aio_wait", txc->otel_span);
+ 	}
+ 	_txc_aio_submit(txc);
+@@ -15635,7 +15635,7 @@ int BlueStore::queue_transactions(
+   if (op) {
+     auto osd_op = dynamic_cast<OpRequest*>(op.get());
+     if (osd_op && osd_op->osd_parent_span) {
+-      txc->otel_span = tracing::osd::tracer.add_span(
++      txc->otel_span = tracing::bluestore::tracer.add_span(
+ 	"queue_transactions", osd_op->osd_parent_span);
+     }
+   }
+diff --git a/src/os/bluestore/bluestore_tracer.cc b/src/os/bluestore/bluestore_tracer.cc
+new file mode 100644
+index 00000000000..32537dd2187
+--- /dev/null
++++ b/src/os/bluestore/bluestore_tracer.cc
+@@ -0,0 +1,12 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++
++#include "bluestore_tracer.h"
++
++namespace tracing {
++namespace bluestore {
++
++tracing::Tracer tracer;
++
++} // namespace bluestore
++} // namespace tracing
+diff --git a/src/os/bluestore/bluestore_tracer.h b/src/os/bluestore/bluestore_tracer.h
+new file mode 100644
+index 00000000000..ff9823d092c
+--- /dev/null
++++ b/src/os/bluestore/bluestore_tracer.h
+@@ -0,0 +1,13 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++#pragma once
++
++#include "common/tracer.h"
++
++namespace tracing {
++namespace bluestore {
++
++extern tracing::Tracer tracer;
++
++} // namespace bluestore
++} // namespace tracing
+-- 
+2.52.0
+

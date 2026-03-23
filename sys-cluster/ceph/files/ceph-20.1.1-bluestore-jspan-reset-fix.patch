@@ -1,0 +1,40 @@
+From 2831a48182d1f1e9faa5ab9e895b494d7717976e Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 17:27:38 -0400
+Subject: [PATCH 07/10] bluestore: fix jspan_ptr::reset() build failure with
+ OTel tracing enabled
+
+opentelemetry::nostd::shared_ptr does not expose a reset() method.
+Replace .reset() with assignment of a default-constructed jspan_ptr()
+to release the span after End().
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/os/bluestore/BlueStore.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index 38bcdb2ccb2..030453ef875 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -14294,7 +14294,7 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+ 
+       if (txc->otel_aio_span) {
+ 	txc->otel_aio_span->End();
+-	txc->otel_aio_span.reset();
++	txc->otel_aio_span = jspan_ptr();
+       }
+       _txc_finish_io(txc);  // may trigger blocked txc's too
+       return;
+@@ -14356,7 +14356,7 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+       throttle.log_state_latency(*txc, logger, l_bluestore_state_kv_done_lat);
+       if (txc->otel_span) {
+ 	txc->otel_span->End();
+-	txc->otel_span.reset();
++	txc->otel_span = jspan_ptr();
+       }
+       if (txc->deferred_txn) {
+ 	txc->set_state(TransContext::STATE_DEFERRED_QUEUED);
+-- 
+2.52.0
+

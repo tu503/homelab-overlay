@@ -1,0 +1,29 @@
+From 70bbadec431535d77035fe8a9ad266eb8ca9e8eb Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 23:33:16 -0400
+Subject: [PATCH 10/10] Fix OSD crash: null-guard cct in Tracer::is_enabled()
+
+The bluestore tracer is never init()ed, so cct remains null.
+Dereferencing it in is_enabled() caused a SEGV on OSD startup.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/tracer.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/tracer.cc b/src/common/tracer.cc
+index 33c28017318..c05adc24e33 100644
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
+@@ -99,7 +99,7 @@ jspan_ptr Tracer::add_span(opentelemetry::nostd::string_view span_name, const js
+ }
+ 
+ bool Tracer::is_enabled() const {
+-  return cct->_conf->jaeger_tracing_enable;
++  return cct && cct->_conf->jaeger_tracing_enable;
+ }
+ 
+ } // namespace tracing
+-- 
+2.52.0
+

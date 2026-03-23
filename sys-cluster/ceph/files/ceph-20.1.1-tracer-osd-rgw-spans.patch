@@ -1,0 +1,227 @@
+From e2a8a4cd4a0539e4fdb0f09e0c1e1774806b9639 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Thu, 19 Mar 2026 19:30:02 -0400
+Subject: [PATCH 02/10] tracer: add spans for OSD op pipeline and RGW data path
+
+OSD: add dequeue_op (with queue latency), do_op, execute_ctx (with
+object name and read/write flags), and issue_repop spans to trace
+the full operation lifecycle after enqueue.
+
+RGW: add get_obj_data and put_obj_data spans inside execute() to
+isolate data transfer time. Add rados_read/rados_write spans in
+rgw_rados_operate() to trace individual RADOS round-trips with
+pool and oid context.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/osd/OSD.cc                    | 13 ++++++++++
+ src/osd/PrimaryLogPG.cc           | 19 ++++++++++++++
+ src/rgw/driver/rados/rgw_tools.cc | 43 ++++++++++++++++++++++++-------
+ src/rgw/rgw_op.cc                 | 22 +++++++++++++---
+ 4 files changed, 84 insertions(+), 13 deletions(-)
+
+diff --git a/src/osd/OSD.cc b/src/osd/OSD.cc
+index a1175bfc9d7..4b2b10db3ae 100644
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -9980,8 +9980,21 @@ void OSD::dequeue_op(
+   op->mark_reached_pg();
+   op->osd_trace.event("dequeue_op");
+ 
++  auto dequeue_span = tracing::osd::tracer.add_span("dequeue_op", op->osd_parent_span);
++  if (dequeue_span->IsRecording()) {
++    dequeue_span->SetAttribute("pg", pg->get_pgid().pgid.ps());
++    dequeue_span->SetAttribute("priority", (int64_t)m->get_priority());
++    dequeue_span->SetAttribute("cost", (int64_t)m->get_cost());
++    dequeue_span->SetAttribute("queue_lat_ms", (double)(latency * 1000.0));
++  }
++
+   pg->do_request(op, handle);
+ 
++  if (dequeue_span->IsRecording()) {
++    utime_t op_lat = ceph_clock_now() - now;
++    dequeue_span->SetAttribute("execute_lat_ms", (double)(op_lat * 1000.0));
++  }
++
+   // finish
+   dout(10) << "dequeue_op " << *op->get_req() << " finish" << dendl;
+   OID_EVENT_TRACE_WITH_MSG(m, "DEQUEUE_OP_END", false);
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+index 9ef012eb930..aa3ccbb62d3 100644
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -1991,6 +1991,11 @@ void PrimaryLogPG::do_request(
+ void PrimaryLogPG::do_op(OpRequestRef& op)
+ {
+   FUNCTRACE(cct);
++  auto do_op_span = tracing::osd::tracer.add_span("do_op", op->osd_parent_span);
++  if (do_op_span->IsRecording()) {
++    do_op_span->SetAttribute("pg", (int64_t)info.pgid.pgid.ps());
++  }
++
+   // NOTE: take a non-const pointer here; we must be careful not to
+   // change anything that will break other reads on m (operator<<).
+   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
+@@ -4203,6 +4208,14 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
+   ObjectContextRef obc = ctx->obc;
+   const hobject_t& soid = obc->obs.oi.soid;
+ 
++  auto exec_span = tracing::osd::tracer.add_span("execute_ctx", op->osd_parent_span);
++  if (exec_span->IsRecording()) {
++    exec_span->SetAttribute("object", soid.oid.name);
++    exec_span->SetAttribute("pg", (int64_t)info.pgid.pgid.ps());
++    exec_span->SetAttribute("may_write", op->may_write());
++    exec_span->SetAttribute("may_read", op->may_read());
++  }
++
+   // this method must be idempotent since we may call it several times
+   // before we finally apply the resulting transaction.
+   ctx->op_t.reset(new PGTransaction);
+@@ -11497,6 +11510,12 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
+           << " o " << soid
+           << dendl;
+ 
++  auto repop_span = tracing::osd::tracer.add_span("issue_repop", ctx->op ? ctx->op->osd_parent_span : jspan_ptr());
++  if (repop_span->IsRecording()) {
++    repop_span->SetAttribute("object", soid.oid.name);
++    repop_span->SetAttribute("rep_tid", (int64_t)repop->rep_tid);
++  }
++
+ 
+   repop->v = ctx->at_version;
+ 
+diff --git a/src/rgw/driver/rados/rgw_tools.cc b/src/rgw/driver/rados/rgw_tools.cc
+index 169b95417f2..fbbc5b7d1e1 100644
+--- a/src/rgw/driver/rados/rgw_tools.cc
++++ b/src/rgw/driver/rados/rgw_tools.cc
+@@ -14,6 +14,7 @@
+ #include "rgw_aio_throttle.h"
+ #include "rgw_asio_thread.h"
+ #include "rgw_compression.h"
++#include "rgw_tracer.h"
+ 
+ #define dout_subsys ceph_subsys_rgw
+ 
+@@ -233,6 +234,13 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+                       optional_yield y, int flags, const jspan_context* trace_info,
+                       version_t* pver)
+ {
++  auto rados_span = tracing::rgw::tracer.add_span("rados_read", trace_info ? *trace_info : jspan_context());
++  if (rados_span->IsRecording()) {
++    rados_span->SetAttribute("oid", oid);
++    rados_span->SetAttribute("pool", ioctx.get_pool_name());
++  }
++
++  int r;
+   // given a yield_context, call async_operate() to yield the coroutine instead
+   // of blocking
+   if (y) {
+@@ -247,12 +255,16 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+     if (pver) {
+       *pver = ver;
+     }
+-    return -ec.value();
++    r = -ec.value();
++  } else {
++    maybe_warn_about_blocking(dpp);
++    r = ioctx.operate(oid, &op, nullptr, flags);
++    if (pver) {
++      *pver = ioctx.get_last_version();
++    }
+   }
+-  maybe_warn_about_blocking(dpp);
+-  int r = ioctx.operate(oid, &op, nullptr, flags);
+-  if (pver) {
+-    *pver = ioctx.get_last_version();
++  if (rados_span->IsRecording()) {
++    rados_span->SetAttribute("retval", r);
+   }
+   return r;
+ }
+@@ -261,6 +273,13 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+                       librados::ObjectWriteOperation&& op, optional_yield y,
+ 		      int flags, const jspan_context* trace_info, version_t* pver)
+ {
++  auto rados_span = tracing::rgw::tracer.add_span("rados_write", trace_info ? *trace_info : jspan_context());
++  if (rados_span->IsRecording()) {
++    rados_span->SetAttribute("oid", oid);
++    rados_span->SetAttribute("pool", ioctx.get_pool_name());
++  }
++
++  int r;
+   if (y) {
+     auto& yield = y.get_yield_context();
+     auto ex = yield.get_executor();
+@@ -270,12 +289,16 @@ int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx, con
+     if (pver) {
+       *pver = ver;
+     }
+-    return -ec.value();
++    r = -ec.value();
++  } else {
++    maybe_warn_about_blocking(dpp);
++    r = ioctx.operate(oid, &op, flags, trace_info);
++    if (pver) {
++      *pver = ioctx.get_last_version();
++    }
+   }
+-  maybe_warn_about_blocking(dpp);
+-  int r = ioctx.operate(oid, &op, flags, trace_info);
+-  if (pver) {
+-    *pver = ioctx.get_last_version();
++  if (rados_span->IsRecording()) {
++    rados_span->SetAttribute("retval", r);
+   }
+   return r;
+ }
+diff --git a/src/rgw/rgw_op.cc b/src/rgw/rgw_op.cc
+index e8ce0cb17eb..29fd54db457 100644
+--- a/src/rgw/rgw_op.cc
++++ b/src/rgw/rgw_op.cc
+@@ -2661,10 +2661,21 @@ void RGWGetObj::execute(optional_yield y)
+ 
+   rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, end-ofs);
+ 
+-  op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
++  {
++    auto data_span = tracing::rgw::tracer.add_span("get_obj_data", s->trace);
++    if (data_span->IsRecording()) {
++      data_span->SetAttribute("ofs", ofs_x);
++      data_span->SetAttribute("end", end_x);
++      data_span->SetAttribute("size", end_x - ofs_x + 1);
++    }
++    op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+ 
+-  if (op_ret >= 0)
+-    op_ret = filter->flush();
++    if (op_ret >= 0)
++      op_ret = filter->flush();
++    if (data_span->IsRecording()) {
++      data_span->SetAttribute("retval", op_ret);
++    }
++  }
+ 
+   rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat, s->time_elapsed());
+ 
+@@ -4603,6 +4614,7 @@ void RGWPutObj::execute(optional_yield y)
+       filter = &*cksum_filter;
+     }
+   } /* !append */
++  auto data_span = tracing::rgw::tracer.add_span("put_obj_data", s->trace);
+   tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
+   do {
+     bufferlist data;
+@@ -4647,6 +4659,10 @@ void RGWPutObj::execute(optional_yield y)
+   if (op_ret < 0) {
+     return;
+   }
++  if (data_span->IsRecording()) {
++    data_span->SetAttribute("size", (int64_t)ofs);
++    data_span->SetAttribute("retval", op_ret);
++  }
+ 
+   if (!chunked_upload && ofs != s->content_length) {
+     op_ret = -ERR_REQUEST_TIMEOUT;
+-- 
+2.52.0
+

@@ -1,0 +1,301 @@
+From 1ca04aa99e49d5df25bec5cfc5e71b675949a28b Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 17:02:16 -0400
+Subject: [PATCH 05/10] tracer: add cross-OSD span linking and
+ BlueStore/replication spans
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Propagate OTEL trace context across OSD sub-operations for both
+replicated and erasure-coded pools, enabling end-to-end trace
+visibility from primary to replica OSDs.
+
+Wire format changes:
+- MOSDRepOp: HEAD_VERSION 3→4, encode/decode otel_trace
+- MOSDECSubOpWrite: HEAD_VERSION 2→3, encode/decode otel_trace
+
+Context propagation:
+- ReplicatedBackend::issue_op() copies osd_parent_span context
+  onto outgoing MOSDRepOp messages
+- ECBackend copies osd_parent_span context to EC Op struct,
+  ECCommon::finish_writes() sets it on outgoing MOSDECSubOpWrite
+
+New spans:
+- queue_transactions: wraps full BlueStore txc lifecycle
+  (STATE_PREPARE through STATE_KV_DONE)
+- txc_aio_wait: child span capturing async I/O wait time
+  (device latency)
+- op_commit: fires when all shards have committed in
+  ReplicatedBackend
+
+Also adds End() and reset() to noop jspan/jspan_ptr stubs for
+non-HAVE_JAEGER builds.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/tracer.h             |  2 ++
+ src/messages/MOSDECSubOpWrite.h |  6 +++++-
+ src/messages/MOSDRepOp.h        |  6 +++++-
+ src/os/bluestore/BlueStore.cc   | 27 +++++++++++++++++++++++++++
+ src/os/bluestore/BlueStore.h    |  3 +++
+ src/osd/ECBackend.cc            |  3 +++
+ src/osd/ECCommon.cc             |  3 +++
+ src/osd/ECCommon.h              |  2 ++
+ src/osd/ReplicatedBackend.cc    | 10 ++++++++++
+ 9 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/src/common/tracer.h b/src/common/tracer.h
+index c0104eb3e4e..fe7235b0054 100644
+--- a/src/common/tracer.h
++++ b/src/common/tracer.h
+@@ -132,6 +132,7 @@ public:
+   jspan_context GetContext() const { return _ctx; }
+   void UpdateName(std::string_view) {}
+   bool IsRecording() { return false; }
++  void End() {}
+ };
+ 
+ class jspan_ptr {
+@@ -144,6 +145,7 @@ public:
+   operator bool() const { return false; }
+   jspan* get() { return &span; }
+   const jspan* get() const { return &span; }
++  void reset() {}
+ };
+ 
+ namespace tracing {
+diff --git a/src/messages/MOSDECSubOpWrite.h b/src/messages/MOSDECSubOpWrite.h
+index 34f0fb55dd2..77b0420096e 100644
+--- a/src/messages/MOSDECSubOpWrite.h
++++ b/src/messages/MOSDECSubOpWrite.h
+@@ -20,7 +20,7 @@
+ 
+ class MOSDECSubOpWrite : public MOSDFastDispatchOp {
+ private:
+-  static constexpr int HEAD_VERSION = 2;
++  static constexpr int HEAD_VERSION = 3;
+   static constexpr int COMPAT_VERSION = 1;
+ 
+ public:
+@@ -59,6 +59,9 @@ public:
+     if (header.version >= 2) {
+       decode(min_epoch, p);
+       decode_trace(p);
++      if (header.version >= 3) {
++	decode_otel_trace(p);
++      }
+     } else {
+       min_epoch = map_epoch;
+     }
+@@ -71,6 +74,7 @@ public:
+     op.encode(payload, data, features);
+     encode(min_epoch, payload);
+     encode_trace(payload, features);
++    encode_otel_trace(payload, features);
+   }
+ 
+   std::string_view get_type_name() const override { return "MOSDECSubOpWrite"; }
+diff --git a/src/messages/MOSDRepOp.h b/src/messages/MOSDRepOp.h
+index 53b3ae342c7..62111e4c917 100644
+--- a/src/messages/MOSDRepOp.h
++++ b/src/messages/MOSDRepOp.h
+@@ -24,7 +24,7 @@
+ 
+ class MOSDRepOp final : public MOSDFastDispatchOp {
+ private:
+-  static constexpr int HEAD_VERSION = 3;
++  static constexpr int HEAD_VERSION = 4;
+   static constexpr int COMPAT_VERSION = 1;
+ 
+ public:
+@@ -114,6 +114,9 @@ public:
+     if (header.version >= 2) {
+       decode(min_epoch, p);
+       decode_trace(p);
++      if (header.version >= 4) {
++        decode_otel_trace(p);
++      }
+     } else {
+       min_epoch = map_epoch;
+     }
+@@ -152,6 +155,7 @@ public:
+     header.version = HEAD_VERSION;
+     encode(min_epoch, payload);
+     encode_trace(payload, features);
++    encode_otel_trace(payload, features);
+     encode(reqid, payload);
+     encode(pgid, payload);
+     encode(poid, payload);
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+index 6ccf1201df2..38bcdb2ccb2 100644
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -60,6 +60,8 @@
+ #include "Writer.h"
+ #include "Compression.h"
+ #include "BlueAdmin.h"
++#include "osd/osd_tracer.h"
++#include "osd/OpRequest.h"
+ 
+ #if defined(WITH_LTTNG)
+ #define TRACEPOINT_DEFINE
+@@ -14269,6 +14271,10 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+         }
+ #endif
+ 	txc->had_ios = true;
++	if (txc->otel_span && txc->otel_span->IsRecording()) {
++	  txc->otel_aio_span = tracing::osd::tracer.add_span(
++	    "txc_aio_wait", txc->otel_span);
++	}
+ 	_txc_aio_submit(txc);
+ 	return;
+       }
+@@ -14286,6 +14292,10 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+ 	}
+       }
+ 
++      if (txc->otel_aio_span) {
++	txc->otel_aio_span->End();
++	txc->otel_aio_span.reset();
++      }
+       _txc_finish_io(txc);  // may trigger blocked txc's too
+       return;
+ 
+@@ -14344,6 +14354,10 @@ void BlueStore::_txc_state_proc(TransContext *txc)
+ 
+     case TransContext::STATE_KV_DONE:
+       throttle.log_state_latency(*txc, logger, l_bluestore_state_kv_done_lat);
++      if (txc->otel_span) {
++	txc->otel_span->End();
++	txc->otel_span.reset();
++      }
+       if (txc->deferred_txn) {
+ 	txc->set_state(TransContext::STATE_DEFERRED_QUEUED);
+ 	_deferred_queue(txc);
+@@ -15617,12 +15631,25 @@ int BlueStore::queue_transactions(
+   TransContext *txc = _txc_create(static_cast<Collection*>(ch.get()), osr,
+ 				  &on_commit, op);
+ 
++  // create otel span for queue_transactions
++  if (op) {
++    auto osd_op = dynamic_cast<OpRequest*>(op.get());
++    if (osd_op && osd_op->osd_parent_span) {
++      txc->otel_span = tracing::osd::tracer.add_span(
++	"queue_transactions", osd_op->osd_parent_span);
++    }
++  }
++
+   for (vector<Transaction>::iterator p = tls.begin(); p != tls.end(); ++p) {
+     txc->bytes += (*p).get_num_bytes();
+     _txc_add_transaction(txc, &(*p));
+   }
+   _txc_calc_cost(txc);
+ 
++  if (txc->otel_span && txc->otel_span->IsRecording()) {
++    txc->otel_span->SetAttribute("bytes", (int64_t)txc->bytes);
++  }
++
+   _txc_write_nodes(txc, txc->t);
+ 
+   // journal deferred items
+diff --git a/src/os/bluestore/BlueStore.h b/src/os/bluestore/BlueStore.h
+index a95dbca34c0..d52ef61321a 100644
+--- a/src/os/bluestore/BlueStore.h
++++ b/src/os/bluestore/BlueStore.h
+@@ -59,6 +59,7 @@
+ #include "BlueFS.h"
+ #include "common/EventTrace.h"
+ #include "common/admin_socket.h"
++#include "common/tracer.h"
+ 
+ #ifdef WITH_BLKIN
+ #include "common/zipkin_trace.h"
+@@ -1956,6 +1957,8 @@ public:
+ #ifdef WITH_BLKIN
+     ZTracer::Trace trace;
+ #endif
++    jspan_ptr otel_span;
++    jspan_ptr otel_aio_span;
+ 
+     ceph::mutex writings_lock = ceph::make_mutex("BlueStore::TransContextWritings::lock");
+     struct WriteObserverEntry {
+diff --git a/src/osd/ECBackend.cc b/src/osd/ECBackend.cc
+index e1477b737d6..64e7742e6d5 100644
+--- a/src/osd/ECBackend.cc
++++ b/src/osd/ECBackend.cc
+@@ -983,6 +983,9 @@ void ECBackend::submit_transaction(
+   op->pipeline = &rmw_pipeline;
+   if (client_op) {
+     op->trace = client_op->pg_trace;
++    if (client_op->osd_parent_span) {
++      op->otel_ctx = client_op->osd_parent_span->GetContext();
++    }
+   }
+   ECTransaction::WritePlan &plans = op->plan;
+ 
+diff --git a/src/osd/ECCommon.cc b/src/osd/ECCommon.cc
+index 66e2b1542df..5c1d1af7be0 100644
+--- a/src/osd/ECCommon.cc
++++ b/src/osd/ECCommon.cc
+@@ -881,6 +881,9 @@ void ECCommon::RMWPipeline::cache_ready(Op &op) {
+       r->map_epoch = get_osdmap_epoch();
+       r->min_epoch = get_parent()->get_interval_start_epoch();
+       r->trace = trace;
++      if (op.otel_ctx.IsValid()) {
++	r->otel_trace = op.otel_ctx;
++      }
+       messages.push_back(std::make_pair(pg_shard.osd, r));
+     }
+   }
+diff --git a/src/osd/ECCommon.h b/src/osd/ECCommon.h
+index 6e9d3a6a7b8..0d525bf68f4 100644
+--- a/src/osd/ECCommon.h
++++ b/src/osd/ECCommon.h
+@@ -23,6 +23,7 @@
+ #include "ECTypes.h"
+ #include "messages/MOSDPGPushReply.h"
+ #include "msg/MessageRef.h"
++#include "common/tracer.h"
+ #if WITH_CRIMSON
+ #include "crimson/osd/object_context.h"
+ #include "os/Transaction.h"
+@@ -475,6 +476,7 @@ struct ECCommon {
+       ceph_tid_t tid;
+       osd_reqid_t reqid;
+       ZTracer::Trace trace;
++      jspan_context otel_ctx;
+ 
+       /**
+        * pg_commited_to
+diff --git a/src/osd/ReplicatedBackend.cc b/src/osd/ReplicatedBackend.cc
+index d4acff869e4..2affa3c6cdc 100644
+--- a/src/osd/ReplicatedBackend.cc
++++ b/src/osd/ReplicatedBackend.cc
+@@ -656,6 +656,12 @@ void ReplicatedBackend::op_commit(const ceph::ref_t<InProgressOp>& op)
+   op->waiting_for_commit.erase(get_parent()->whoami_shard());
+ 
+   if (op->waiting_for_commit.empty()) {
++    if (op->op && op->op->osd_parent_span) {
++      auto span = tracing::osd::tracer.add_span("op_commit", op->op->osd_parent_span);
++      if (span->IsRecording()) {
++	span->SetAttribute("tid", (int64_t)op->tid);
++      }
++    }
+     op->on_commit->complete(0);
+     op->on_commit = 0;
+     in_progress_ops.erase(op->tid);
+@@ -1180,6 +1186,10 @@ void ReplicatedBackend::issue_op(
+ 	  pinfo);
+       if (op->op && op->op->pg_trace)
+ 	wr->trace.init("replicated op", nullptr, &op->op->pg_trace);
++      if (op->op && op->op->osd_parent_span) {
++	static_cast<MOSDRepOp*>(wr)->otel_trace =
++	  op->op->osd_parent_span->GetContext();
++      }
+       get_parent()->send_message_osd_cluster(
+ 	  shard.osd, wr, get_osdmap_epoch());
+     }
+-- 
+2.52.0
+

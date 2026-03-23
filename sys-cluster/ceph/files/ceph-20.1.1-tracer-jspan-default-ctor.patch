@@ -1,0 +1,45 @@
+From 775c6769f6c195fa0a14ca5a721386b6f47be967 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 18:11:11 -0400
+Subject: [PATCH 08/10] tracer: fix jspan_context default construction with
+ OTel tracing enabled
+
+opentelemetry::trace::SpanContext has no default constructor when OTel
+is enabled. Use SpanContext::GetInvalid() as the in-class initializer
+for ECCommon::Op::otel_ctx, and add GetInvalid() to the no-op stub
+SpanContext so both code paths compile.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/tracer.h | 1 +
+ src/osd/ECCommon.h  | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/tracer.h b/src/common/tracer.h
+index fe7235b0054..38e17b33ec8 100644
+--- a/src/common/tracer.h
++++ b/src/common/tracer.h
+@@ -114,6 +114,7 @@ public:
+   SpanContext() = default;
+   SpanContext(bool sampled_flag, bool is_remote) {}
+   bool IsValid() const { return false;}
++  static SpanContext GetInvalid() { return SpanContext(); }
+ };
+ } // namespace trace
+ } // namespace v1
+diff --git a/src/osd/ECCommon.h b/src/osd/ECCommon.h
+index 0d525bf68f4..2eaf30f5cd4 100644
+--- a/src/osd/ECCommon.h
++++ b/src/osd/ECCommon.h
+@@ -476,7 +476,7 @@ struct ECCommon {
+       ceph_tid_t tid;
+       osd_reqid_t reqid;
+       ZTracer::Trace trace;
+-      jspan_context otel_ctx;
++      jspan_context otel_ctx{jspan_context::GetInvalid()};
+ 
+       /**
+        * pg_commited_to
+-- 
+2.52.0
+

@@ -1,0 +1,201 @@
+From 0990b46ffb44e35cb5d453fc4bbe039474a86e16 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 17:24:12 -0400
+Subject: [PATCH 06/10] osd: instrument OSD-to-OSD peering with per-peer RTT,
+ queue dwell, and restart counters
+
+Add three new peering instrumentation points exposed via recoverystate_perf
+perfcounters:
+
+1. Per-peer RTT in GetInfo: timestamps query send per peer and computes
+   round-trip time on MNotifyRec receipt. Tracks both individual peer RTT
+   (getinfo_peer_rtt) and slowest peer per round (getinfo_slowest_peer_rtt)
+   to identify which OSD is the peering bottleneck.
+
+2. Peering queue dwell time: stamps PGPeeringEvent at creation and measures
+   enqueue-to-dequeue latency (peering_queue_latency) to surface thread
+   starvation and queue contention. Logs at level 5 when dwell exceeds 100ms.
+
+3. Peering restart count: increments peering_restart_count on each Peering
+   state entry to detect PG flapping across OSD map changes.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/osd/PG.cc                | 12 ++++++++++++
+ src/osd/PGPeeringEvent.h     |  6 ++++++
+ src/osd/PeeringState.cc      | 24 ++++++++++++++++++++++++
+ src/osd/PeeringState.h       |  2 ++
+ src/osd/osd_perf_counters.cc |  4 ++++
+ src/osd/osd_perf_counters.h  |  4 ++++
+ 6 files changed, 52 insertions(+)
+
+diff --git a/src/osd/PG.cc b/src/osd/PG.cc
+index 46e97f24e79..6102d1eb761 100644
+--- a/src/osd/PG.cc
++++ b/src/osd/PG.cc
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include "PG.h"
++#include "osd_perf_counters.h"
+ #include "messages/MOSDRepScrub.h"
+ 
+ #include "common/debug.h"
+@@ -2114,6 +2115,17 @@ bool PG::can_discard_request(OpRequestRef& op)
+ void PG::do_peering_event(PGPeeringEventRef evt, PeeringCtx &rctx)
+ {
+   dout(10) << __func__ << ": " << evt->get_desc() << dendl;
++
++  // Rec 2: measure queue dwell time
++  {
++    utime_t dwell = ceph_clock_now() - evt->get_stamp();
++    get_peering_perf().tinc(rs_peering_queue_latency, dwell);
++    if (dwell > utime_t(0, 100000000)) { // > 100ms
++      dout(5) << __func__ << " peering event queued for " << dwell
++	      << ": " << evt->get_desc() << dendl;
++    }
++  }
++
+   ceph_assert(have_same_or_newer_map(evt->get_epoch_sent()));
+   if (old_peering_evt(evt)) {
+     dout(10) << "discard old " << evt->get_desc() << dendl;
+diff --git a/src/osd/PGPeeringEvent.h b/src/osd/PGPeeringEvent.h
+index 4d1099d6ff1..1ce3405beb2 100644
+--- a/src/osd/PGPeeringEvent.h
++++ b/src/osd/PGPeeringEvent.h
+@@ -11,6 +11,7 @@
+ #include <boost/intrusive_ptr.hpp>
+ #include <boost/statechart/event.hpp>
+ 
++#include "common/Clock.h"
+ #include "osd/osd_types.h"
+ 
+ class MOSDPGLog;
+@@ -33,6 +34,7 @@ class PGPeeringEvent {
+   epoch_t epoch_sent;
+   epoch_t epoch_requested;
+   std::string desc;
++  utime_t stamp;  // Rec 2: creation time for queue dwell measurement
+ public:
+   boost::intrusive_ptr< const boost::statechart::event_base > evt;
+   bool requires_pg;
+@@ -47,6 +49,7 @@ public:
+     PGCreateInfo *ci = 0)
+     : epoch_sent(epoch_sent),
+       epoch_requested(epoch_requested),
++      stamp(ceph_clock_now()),
+       evt(evt_.intrusive_from_this()),
+       requires_pg(req),
+       create_info(ci) {
+@@ -71,6 +74,9 @@ public:
+   const std::string& get_desc() const {
+     return desc;
+   }
++  const utime_t& get_stamp() const {
++    return stamp;
++  }
+ };
+ typedef std::shared_ptr<PGPeeringEvent> PGPeeringEventRef;
+ typedef std::unique_ptr<PGPeeringEvent> PGPeeringEventURef;
+diff --git a/src/osd/PeeringState.cc b/src/osd/PeeringState.cc
+index 1963ac03300..cdbbf4f08e3 100644
+--- a/src/osd/PeeringState.cc
++++ b/src/osd/PeeringState.cc
+@@ -5504,6 +5504,9 @@ PeeringState::Peering::Peering(my_context ctx)
+   ceph_assert(!ps->is_peering());
+   ceph_assert(ps->is_primary());
+   ps->state_set(PG_STATE_PEERING);
++
++  // Rec 3: count peering entries (restarts show up as repeated increments)
++  pl->get_peering_perf().inc(rs_peering_restart_count);
+ }
+ 
+ boost::statechart::result PeeringState::Peering::react(const AdvMap& advmap)
+@@ -7438,6 +7441,7 @@ void PeeringState::GetInfo::get_infos()
+ 		   ps->info.history,
+ 		   ps->get_osdmap_epoch()));
+       peer_info_requested.insert(peer);
++      peer_query_sent[peer] = ceph_clock_now();
+       ps->blocked_by.insert(peer.osd);
+     }
+   }
+@@ -7456,6 +7460,19 @@ boost::statechart::result PeeringState::GetInfo::react(const MNotifyRec& infoevt
+   if (p != peer_info_requested.end()) {
+     peer_info_requested.erase(p);
+     ps->blocked_by.erase(infoevt.from.osd);
++
++    // Rec 1: per-peer RTT measurement
++    auto sq = peer_query_sent.find(infoevt.from);
++    if (sq != peer_query_sent.end()) {
++      utime_t rtt = ceph_clock_now() - sq->second;
++      pl->get_peering_perf().tinc(rs_getinfo_peer_rtt, rtt);
++      if (rtt > slowest_peer_rtt) {
++	slowest_peer_rtt = rtt;
++      }
++      psdout(10) << " osd." << infoevt.from
++		 << " GetInfo RTT " << rtt << dendl;
++      peer_query_sent.erase(sq);
++    }
+   }
+ 
+   epoch_t old_start = ps->info.history.last_epoch_started;
+@@ -7537,6 +7554,13 @@ void PeeringState::GetInfo::exit()
+   DECLARE_LOCALS;
+   utime_t dur = ceph_clock_now() - enter_time;
+   pl->get_peering_perf().tinc(rs_getinfo_latency, dur);
++
++  // Rec 1: record the slowest peer RTT for this GetInfo round
++  if (slowest_peer_rtt > utime_t()) {
++    pl->get_peering_perf().tinc(rs_getinfo_slowest_peer_rtt, slowest_peer_rtt);
++    psdout(10) << " GetInfo slowest peer RTT: " << slowest_peer_rtt << dendl;
++  }
++
+   ps->blocked_by.clear();
+ }
+ 
+diff --git a/src/osd/PeeringState.h b/src/osd/PeeringState.h
+index 0d8a001bca1..b19aae91c04 100644
+--- a/src/osd/PeeringState.h
++++ b/src/osd/PeeringState.h
+@@ -1290,6 +1290,8 @@ public:
+ 
+   struct GetInfo : boost::statechart::state< GetInfo, Peering >, NamedState {
+     std::set<pg_shard_t> peer_info_requested;
++    std::map<pg_shard_t, utime_t> peer_query_sent;  // send timestamp per peer
++    utime_t slowest_peer_rtt;                        // track max RTT this round
+ 
+     explicit GetInfo(my_context ctx);
+     void exit();
+diff --git a/src/osd/osd_perf_counters.cc b/src/osd/osd_perf_counters.cc
+index 7959765f90c..0d37c3817bd 100644
+--- a/src/osd/osd_perf_counters.cc
++++ b/src/osd/osd_perf_counters.cc
+@@ -514,6 +514,10 @@ PerfCounters *build_recoverystate_perf(CephContext *cct) {
+   rs_perf.add_time_avg(rs_getmissing_latency, "getmissing_latency", "Getmissing recovery state latency");
+   rs_perf.add_time_avg(rs_waitupthru_latency, "waitupthru_latency", "Waitupthru recovery state latency");
+   rs_perf.add_time_avg(rs_notrecovering_latency, "notrecovering_latency", "Notrecovering recovery state latency");
++  rs_perf.add_time_avg(rs_getinfo_peer_rtt, "getinfo_peer_rtt", "Per-peer round-trip time during GetInfo");
++  rs_perf.add_time_avg(rs_getinfo_slowest_peer_rtt, "getinfo_slowest_peer_rtt", "Slowest peer RTT per GetInfo round");
++  rs_perf.add_time_avg(rs_peering_queue_latency, "peering_queue_latency", "Peering event queue dwell time");
++  rs_perf.add_u64_counter(rs_peering_restart_count, "peering_restart_count", "Number of times Peering state entered");
+ 
+   return rs_perf.create_perf_counters();
+ }
+diff --git a/src/osd/osd_perf_counters.h b/src/osd/osd_perf_counters.h
+index 2f6ac21276f..f90cc9af5ba 100644
+--- a/src/osd/osd_perf_counters.h
++++ b/src/osd/osd_perf_counters.h
+@@ -251,6 +251,10 @@ enum {
+   rs_getmissing_latency,
+   rs_waitupthru_latency,
+   rs_notrecovering_latency,
++  rs_getinfo_peer_rtt,        // per-peer RTT during GetInfo (time_avg)
++  rs_getinfo_slowest_peer_rtt, // slowest peer RTT per GetInfo round (time_avg)
++  rs_peering_queue_latency,   // enqueue-to-dequeue dwell time (time_avg)
++  rs_peering_restart_count,   // number of times Peering state entered (counter)
+   rs_last,
+ };
+ 
+-- 
+2.52.0
+

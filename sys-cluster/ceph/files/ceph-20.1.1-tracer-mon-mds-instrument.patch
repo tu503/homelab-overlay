@@ -1,0 +1,500 @@
+From f486c24abfcb4393e72fcf832847ea9817080f37 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Fri, 20 Mar 2026 15:32:26 -0400
+Subject: [PATCH 04/10] tracer: add process identification and instrument
+ MON/MDS daemons
+
+Extend Tracer::init() with service.instance.id resource attribute and
+optional extra attributes to identify individual daemon processes in
+traces. Add tracing infrastructure to MON (Paxos consensus, command
+dispatch) and MDS (client POSIX operations) which previously had zero
+OTLP instrumentation.
+
+Process identification:
+- OSD: instance.id = whoami (e.g. "0")
+- RGW: instance.id = hostname:pid, extra attr rgw.zone
+- MON: instance.id = mon name (e.g. "sm3")
+- MDS: instance.id = hostname:pid, extra attr mds.rank
+
+MON spans: dispatch_op, handle_command, paxos_begin, paxos_commit,
+paxos_propose
+MDS spans: client_request, lookup, getattr, open, readdir, mkdir,
+unlink, rmdir, rename
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/tracer.cc   | 14 +++++++++++--
+ src/common/tracer.h    | 10 ++++++++--
+ src/mds/CMakeLists.txt |  6 +++++-
+ src/mds/MDSRank.cc     |  8 ++++++++
+ src/mds/Server.cc      | 45 ++++++++++++++++++++++++++++++++++++++++++
+ src/mds/mds_tracer.cc  | 12 +++++++++++
+ src/mds/mds_tracer.h   | 13 ++++++++++++
+ src/mon/CMakeLists.txt |  3 ++-
+ src/mon/Monitor.cc     | 14 +++++++++++++
+ src/mon/Paxos.cc       | 24 +++++++++++++++++++++-
+ src/mon/mon_tracer.cc  | 12 +++++++++++
+ src/mon/mon_tracer.h   | 13 ++++++++++++
+ src/osd/OSD.cc         |  2 +-
+ src/rgw/rgw_appmain.cc |  6 +++++-
+ 14 files changed, 173 insertions(+), 9 deletions(-)
+ create mode 100644 src/mds/mds_tracer.cc
+ create mode 100644 src/mds/mds_tracer.h
+ create mode 100644 src/mon/mon_tracer.cc
+ create mode 100644 src/mon/mon_tracer.h
+
+diff --git a/src/common/tracer.cc b/src/common/tracer.cc
+index 29eb5ac24e6..33c28017318 100644
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
+@@ -22,7 +22,9 @@ const jspan_ptr Tracer::noop_span = noop_tracer->StartSpan("noop");
+ 
+ using bufferlist = ceph::buffer::list;
+ 
+-void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_name) {
++void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_name,
++                  opentelemetry::nostd::string_view instance_id,
++                  const std::map<std::string, std::string>& extra_attrs) {
+   ceph_assert(_cct);
+   cct = _cct;
+   if (!tracer) {
+@@ -38,7 +40,15 @@ void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_n
+     ldout(cct, 3) << "OTLP HTTP exporter endpoint: " << exporter_options.url << dendl;
+     auto otlp_exporter = opentelemetry::exporter::otlp::OtlpHttpExporterFactory::Create(exporter_options);
+     const opentelemetry::sdk::trace::BatchSpanProcessorOptions processor_options;
+-    const auto resource = opentelemetry::sdk::resource::Resource::Create(std::move(opentelemetry::sdk::resource::ResourceAttributes{{"service.name", service_name}}));
++    opentelemetry::sdk::resource::ResourceAttributes res_attrs{{"service.name", service_name}};
++    if (!instance_id.empty()) {
++      res_attrs.SetAttribute("service.instance.id", instance_id);
++    }
++    for (const auto& [k, v] : extra_attrs) {
++      res_attrs.SetAttribute(opentelemetry::nostd::string_view(k),
++                             opentelemetry::common::AttributeValue(opentelemetry::nostd::string_view(v)));
++    }
++    const auto resource = opentelemetry::sdk::resource::Resource::Create(std::move(res_attrs));
+     auto processor = std::unique_ptr<opentelemetry::sdk::trace::SpanProcessor>(new opentelemetry::sdk::trace::BatchSpanProcessor(std::move(otlp_exporter), processor_options));
+     const auto provider = opentelemetry::nostd::shared_ptr<opentelemetry::trace::TracerProvider>(new opentelemetry::sdk::trace::TracerProvider(std::move(processor), resource));
+     opentelemetry::trace::Provider::SetTracerProvider(provider);
+diff --git a/src/common/tracer.h b/src/common/tracer.h
+index ee0b7440754..c0104eb3e4e 100644
+--- a/src/common/tracer.h
++++ b/src/common/tracer.h
+@@ -5,6 +5,8 @@
+ 
+ #include "acconfig.h"
+ #include "include/encoding.h"
++#include <map>
++#include <string>
+ 
+ #ifdef HAVE_JAEGER
+ #include "opentelemetry/trace/provider.h"
+@@ -32,7 +34,9 @@ class Tracer {
+ 
+   Tracer() = default;
+ 
+-  void init(CephContext* _cct, opentelemetry::nostd::string_view service_name);
++  void init(CephContext* _cct, opentelemetry::nostd::string_view service_name,
++            opentelemetry::nostd::string_view instance_id = "",
++            const std::map<std::string, std::string>& extra_attrs = {});
+ 
+   bool is_enabled() const;
+   // creates and returns a new span with `trace_name`
+@@ -145,7 +149,9 @@ public:
+ namespace tracing {
+ 
+ struct Tracer {
+-  void init(CephContext* _cct, std::string_view service_name) {}
++  void init(CephContext* _cct, std::string_view service_name,
++            std::string_view instance_id = "",
++            const std::map<std::string, std::string>& extra_attrs = {}) {}
+   bool is_enabled() const { return false; }
+   jspan_ptr start_trace(std::string_view, bool enabled = true) { return {}; }
+   jspan_ptr add_span(std::string_view, const jspan_ptr&) { return {}; }
+diff --git a/src/mds/CMakeLists.txt b/src/mds/CMakeLists.txt
+index f3980c7e04b..133fd772299 100644
+--- a/src/mds/CMakeLists.txt
++++ b/src/mds/CMakeLists.txt
+@@ -48,9 +48,13 @@ set(mds_srcs
+   ${CMAKE_SOURCE_DIR}/src/common/TrackedOp.cc
+   ${CMAKE_SOURCE_DIR}/src/common/MemoryModel.cc
+   ${CMAKE_SOURCE_DIR}/src/osdc/Journaler.cc
+-  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc)
++  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc
++  mds_tracer.cc)
+ add_library(mds STATIC ${mds_srcs})
+ target_link_libraries(mds PRIVATE
+   legacy-option-headers Boost::url
+   heap_profiler cpu_profiler osdc ${LUA_LIBRARIES})
++if(WITH_JAEGER)
++  target_link_libraries(mds PRIVATE jaeger_base)
++endif()
+ target_include_directories(mds PRIVATE "${LUA_INCLUDE_DIR}")
+diff --git a/src/mds/MDSRank.cc b/src/mds/MDSRank.cc
+index 59f695a8c04..ad59750ad07 100644
+--- a/src/mds/MDSRank.cc
++++ b/src/mds/MDSRank.cc
+@@ -55,6 +55,10 @@
+ 
+ #include "QuiesceDbManager.h"
+ #include "QuiesceAgent.h"
++#include "mds_tracer.h"
++#include "common/hostname.h"
++#include "include/stringify.h"
++#include <unistd.h>
+ 
+ #define dout_context g_ceph_context
+ #define dout_subsys ceph_subsys_mds
+@@ -575,6 +579,10 @@ MDSRank::~MDSRank()
+ 
+ void MDSRankDispatcher::init()
+ {
++  std::string mds_instance_id = ceph_get_short_hostname() + ":" + stringify(getpid());
++  tracing::mds::tracer.init(g_ceph_context, "mds", mds_instance_id,
++                            {{"mds.rank", stringify((int)whoami)}});
++
+   objecter->init();
+   messenger->add_dispatcher_tail(objecter); // the default priority
+ 
+diff --git a/src/mds/Server.cc b/src/mds/Server.cc
+index 6dd9b330972..49bf9602934 100644
+--- a/src/mds/Server.cc
++++ b/src/mds/Server.cc
+@@ -77,6 +77,7 @@
+ #include "common/config.h"
+ 
+ #include "msg/Message.h"
++#include "mds_tracer.h"
+ 
+ #define dout_context g_ceph_context
+ #define dout_subsys ceph_subsys_mds
+@@ -2579,6 +2580,16 @@ void Server::handle_client_request(const cref_t<MClientRequest> &req)
+ {
+   dout(4) << "handle_client_request " << *req << dendl;
+ 
++  auto req_span = tracing::mds::tracer.start_trace("client_request");
++  if (req_span->IsRecording()) {
++    req_span->SetAttribute("op", ceph_mds_op_name(req->get_op()));
++    req_span->SetAttribute("client", stringify(req->get_source()));
++    auto path = req->get_filepath().get_path();
++    if (!path.empty()) {
++      req_span->SetAttribute("path", path);
++    }
++  }
++
+   if (mds->logger)
+     mds->logger->inc(l_mds_request);
+   if (logger)
+@@ -4175,6 +4186,12 @@ CDir* Server::try_open_auth_dirfrag(CInode *diri, frag_t fg, const MDRequestRef&
+ void Server::handle_client_getattr(const MDRequestRef& mdr, bool is_lookup)
+ {
+   const cref_t<MClientRequest> &req = mdr->client_request;
++
++  auto span = tracing::mds::tracer.start_trace(is_lookup ? "lookup" : "getattr");
++  if (span->IsRecording()) {
++    span->SetAttribute("path", req->get_filepath().get_path());
++  }
++
+   client_t client = mdr->get_client();
+ 
+   if (req->get_filepath().depth() == 0 && is_lookup) {
+@@ -4538,6 +4555,12 @@ void Server::handle_client_open(const MDRequestRef& mdr)
+   const cref_t<MClientRequest> &req = mdr->client_request;
+   dout(7) << "open on " << req->get_filepath() << dendl;
+ 
++  auto span = tracing::mds::tracer.start_trace("open");
++  if (span->IsRecording()) {
++    span->SetAttribute("path", req->get_filepath().get_path());
++    span->SetAttribute("flags", (int64_t)req->head.args.open.flags);
++  }
++
+   int flags = req->head.args.open.flags;
+   int cmode = ceph_flags_to_mode(flags);
+   if (cmode < 0) {
+@@ -4987,6 +5010,12 @@ void Server::_finalize_readdir(const MDRequestRef& mdr,
+ void Server::handle_client_readdir(const MDRequestRef& mdr)
+ {
+   const cref_t<MClientRequest> &req = mdr->client_request;
++
++  auto span = tracing::mds::tracer.start_trace("readdir");
++  if (span->IsRecording()) {
++    span->SetAttribute("path", req->get_filepath().get_path());
++  }
++
+   Session *session = mds->get_session(req);
+   client_t client = req->get_source().num();
+   MutationImpl::LockOpVec lov;
+@@ -7419,6 +7448,11 @@ void Server::handle_client_mkdir(const MDRequestRef& mdr)
+ {
+   const cref_t<MClientRequest> &req = mdr->client_request;
+ 
++  auto span = tracing::mds::tracer.start_trace("mkdir");
++  if (span->IsRecording()) {
++    span->SetAttribute("path", req->get_filepath().get_path());
++  }
++
+   mdr->disable_lock_cache();
+   CDentry *dn = rdlock_path_xlock_dentry(mdr, true);
+   if (!dn)
+@@ -8304,6 +8338,11 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
+   // rmdir or unlink?
+   bool rmdir = (req->get_op() == CEPH_MDS_OP_RMDIR);
+ 
++  auto span = tracing::mds::tracer.start_trace(rmdir ? "rmdir" : "unlink");
++  if (span->IsRecording()) {
++    span->SetAttribute("path", req->get_filepath().get_path());
++  }
++
+   if (rmdir)
+     mdr->disable_lock_cache();
+   CDentry *dn = rdlock_path_xlock_dentry(mdr, false, true);
+@@ -9050,6 +9089,12 @@ void Server::handle_client_rename(const MDRequestRef& mdr)
+ 
+   filepath destpath = req->get_filepath();
+   filepath srcpath = req->get_filepath2();
++
++  auto span = tracing::mds::tracer.start_trace("rename");
++  if (span->IsRecording()) {
++    span->SetAttribute("src_path", srcpath.get_path());
++    span->SetAttribute("dst_path", destpath.get_path());
++  }
+   if (srcpath.is_last_dot_or_dotdot() || destpath.is_last_dot_or_dotdot()) {
+     respond_to_request(mdr, -EBUSY);
+     return;
+diff --git a/src/mds/mds_tracer.cc b/src/mds/mds_tracer.cc
+new file mode 100644
+index 00000000000..23670ecf0fc
+--- /dev/null
++++ b/src/mds/mds_tracer.cc
+@@ -0,0 +1,12 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++
++#include "mds_tracer.h"
++
++namespace tracing {
++namespace mds {
++
++tracing::Tracer tracer;
++
++} // namespace mds
++} // namespace tracing
+diff --git a/src/mds/mds_tracer.h b/src/mds/mds_tracer.h
+new file mode 100644
+index 00000000000..90096dcf22f
+--- /dev/null
++++ b/src/mds/mds_tracer.h
+@@ -0,0 +1,13 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++#pragma once
++
++#include "common/tracer.h"
++
++namespace tracing {
++namespace mds {
++
++extern tracing::Tracer tracer;
++
++} // namespace mds
++} // namespace tracing
+diff --git a/src/mon/CMakeLists.txt b/src/mon/CMakeLists.txt
+index c5bf64f8c15..43a20012587 100644
+--- a/src/mon/CMakeLists.txt
++++ b/src/mon/CMakeLists.txt
+@@ -26,7 +26,8 @@ set(lib_mon_srcs
+   ../mds/MDSAuthCaps.cc
+   ../mgr/mgr_commands.cc
+   ../osd/OSDCap.cc
+-  ../mgr/MgrCap.cc)
++  ../mgr/MgrCap.cc
++  mon_tracer.cc)
+ 
+ if(TARGET mgr_cap_obj)
+   list(APPEND lib_mon_srcs $<TARGET_OBJECTS:mgr_cap_obj>)
+diff --git a/src/mon/Monitor.cc b/src/mon/Monitor.cc
+index bfa32678a98..790e23f96b6 100644
+--- a/src/mon/Monitor.cc
++++ b/src/mon/Monitor.cc
+@@ -95,6 +95,7 @@
+ #include "perfglue/heap_profiler.h"
+ 
+ #include "auth/none/AuthNoneClientHandler.h"
++#include "mon_tracer.h"
+ 
+ #ifdef WITH_CRIMSON
+ #include "crimson/common/perf_counters_collection.h"
+@@ -953,6 +954,8 @@ int Monitor::init()
+   dout(2) << "init" << dendl;
+   std::lock_guard l(lock);
+ 
++  tracing::mon::tracer.init(cct, "mon", name);
++
+   finisher.start();
+ 
+   // start ticker
+@@ -3439,6 +3442,12 @@ void Monitor::handle_command(MonOpRequestRef op)
+ 
+   dout(0) << "handle_command " << *m << dendl;
+ 
++  auto cmd_span = tracing::mon::tracer.start_trace("handle_command");
++  if (cmd_span->IsRecording()) {
++    cmd_span->SetAttribute("prefix", prefix);
++    cmd_span->SetAttribute("src", stringify(m->get_source_inst()));
++  }
++
+   string format = cmd_getval_or<string>(cmdmap, "format", "plain");
+   boost::scoped_ptr<Formatter> f(Formatter::create(format));
+ 
+@@ -4598,6 +4607,11 @@ void Monitor::_ms_dispatch(Message *m)
+ void Monitor::dispatch_op(MonOpRequestRef op)
+ {
+   op->mark_event("mon:dispatch_op");
++  auto dispatch_span = tracing::mon::tracer.start_trace("dispatch_op");
++  if (dispatch_span->IsRecording()) {
++    dispatch_span->SetAttribute("msg_type", (int64_t)op->get_req()->get_type());
++    dispatch_span->SetAttribute("src", stringify(op->get_req()->get_source_inst()));
++  }
+ 
+   MonSession *s = op->get_session();
+   ceph_assert(s);
+diff --git a/src/mon/Paxos.cc b/src/mon/Paxos.cc
+index 2a6167ec2e1..f16be19b7e8 100644
+--- a/src/mon/Paxos.cc
++++ b/src/mon/Paxos.cc
+@@ -22,6 +22,7 @@
+ #include "include/stringify.h"
+ #include "common/Timer.h"
+ #include "messages/PaxosServiceMessage.h"
++#include "mon_tracer.h"
+ 
+ #ifdef WITH_CRIMSON
+ #include "crimson/common/perf_counters_collection.h"
+@@ -617,10 +618,17 @@ void Paxos::collect_timeout()
+ // leader
+ void Paxos::begin(bufferlist& v)
+ {
+-  dout(10) << "begin for " << last_committed+1 << " " 
++  dout(10) << "begin for " << last_committed+1 << " "
+ 	   << v.length() << " bytes"
+ 	   << dendl;
+ 
++  auto paxos_span = tracing::mon::tracer.start_trace("paxos_begin");
++  if (paxos_span->IsRecording()) {
++    paxos_span->SetAttribute("version", (int64_t)(last_committed + 1));
++    paxos_span->SetAttribute("value_size", (int64_t)v.length());
++    paxos_span->SetAttribute("paxos_name", paxos_name);
++  }
++
+   ceph_assert(mon.is_leader());
+   ceph_assert(is_updating() || is_updating_previous());
+ 
+@@ -853,6 +861,12 @@ void Paxos::commit_start()
+ {
+   dout(10) << __func__ << " " << (last_committed+1) << dendl;
+ 
++  auto commit_span = tracing::mon::tracer.start_trace("paxos_commit");
++  if (commit_span->IsRecording()) {
++    commit_span->SetAttribute("version", (int64_t)(last_committed + 1));
++    commit_span->SetAttribute("paxos_name", paxos_name);
++  }
++
+   ceph_assert(g_conf()->paxos_kill_at != 7);
+ 
+   auto t(std::make_shared<MonitorDBStore::Transaction>());
+@@ -1537,11 +1551,19 @@ void Paxos::propose_pending()
+   ceph_assert(is_active());
+   ceph_assert(pending_proposal);
+ 
++  auto propose_span = tracing::mon::tracer.start_trace("paxos_propose");
++
+   cancel_events();
+ 
+   bufferlist bl;
+   pending_proposal->encode(bl);
+ 
++  if (propose_span->IsRecording()) {
++    propose_span->SetAttribute("version", (int64_t)(last_committed + 1));
++    propose_span->SetAttribute("value_size", (int64_t)bl.length());
++    propose_span->SetAttribute("paxos_name", paxos_name);
++  }
++
+   dout(10) << __func__ << " " << (last_committed + 1)
+ 	   << " " << bl.length() << " bytes" << dendl;
+   dout(30) << __func__ << " transaction dump:\n";
+diff --git a/src/mon/mon_tracer.cc b/src/mon/mon_tracer.cc
+new file mode 100644
+index 00000000000..14faa03e416
+--- /dev/null
++++ b/src/mon/mon_tracer.cc
+@@ -0,0 +1,12 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++
++#include "mon_tracer.h"
++
++namespace tracing {
++namespace mon {
++
++tracing::Tracer tracer;
++
++} // namespace mon
++} // namespace tracing
+diff --git a/src/mon/mon_tracer.h b/src/mon/mon_tracer.h
+new file mode 100644
+index 00000000000..4c8f378f956
+--- /dev/null
++++ b/src/mon/mon_tracer.h
+@@ -0,0 +1,13 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++#pragma once
++
++#include "common/tracer.h"
++
++namespace tracing {
++namespace mon {
++
++extern tracing::Tracer tracer;
++
++} // namespace mon
++} // namespace tracing
+diff --git a/src/osd/OSD.cc b/src/osd/OSD.cc
+index 4b2b10db3ae..8aa4dcb820e 100644
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -3744,7 +3744,7 @@ int OSD::init()
+   std::lock_guard lock(osd_lock);
+   if (is_stopping())
+     return 0;
+-  tracing::osd::tracer.init(cct, "osd");
++  tracing::osd::tracer.init(cct, "osd", std::to_string(whoami));
+   tick_timer.init();
+   tick_timer_without_osd_lock.init();
+   service.recovery_request_timer.init();
+diff --git a/src/rgw/rgw_appmain.cc b/src/rgw/rgw_appmain.cc
+index 07561ca55f6..eff4e66ae72 100644
+--- a/src/rgw/rgw_appmain.cc
++++ b/src/rgw/rgw_appmain.cc
+@@ -18,6 +18,7 @@
+ #include "global/signal_handler.h"
+ #include "common/config.h"
+ #include "common/errno.h"
++#include "common/hostname.h"
+ #include "common/Timer.h"
+ #include "common/TracepointProvider.h"
+ #include "common/openssl_opts_handler.h"
+@@ -556,7 +557,10 @@ void rgw::AppMain::init_tracepoints()
+ {
+   TracepointProvider::initialize<rgw_rados_tracepoint_traits>(dpp->get_cct());
+   TracepointProvider::initialize<rgw_op_tracepoint_traits>(dpp->get_cct());
+-  tracing::rgw::tracer.init(dpp->get_cct(), "rgw");
++  std::string rgw_instance_id = ceph_get_short_hostname() + ":" + stringify(getpid());
++  std::string rgw_zone = dpp->get_cct()->_conf.get_val<std::string>("rgw_zone");
++  tracing::rgw::tracer.init(dpp->get_cct(), "rgw", rgw_instance_id,
++                            {{"rgw.zone", rgw_zone}});
+ } /* init_tracepoints() */
+ 
+ void rgw::AppMain::init_lua()
+-- 
+2.52.0
+
