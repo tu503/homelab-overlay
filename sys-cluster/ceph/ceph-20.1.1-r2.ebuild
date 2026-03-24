@@ -244,6 +244,7 @@ PATCHES=(
 	"${FILESDIR}/ceph-20.1.1-bluestore-local-tracer.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-null-guard.patch"
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-trace-propagation.patch"
+	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 
 check-reqs_export_vars() {

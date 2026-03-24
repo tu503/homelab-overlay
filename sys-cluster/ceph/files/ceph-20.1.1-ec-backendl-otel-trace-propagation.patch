@@ -1,0 +1,40 @@
+diff --git a/src/osd/ECBackendL.cc b/src/osd/ECBackendL.cc
+index 79666f9370c..a4cf20b9296 100644
+--- a/src/osd/ECBackendL.cc
++++ b/src/osd/ECBackendL.cc
+@@ -1533,6 +1533,9 @@ void ECBackendL::submit_transaction(
+   op->client_op = client_op;
+   if (client_op) {
+     op->trace = client_op->pg_trace;
++    if (client_op->osd_parent_span) {
++      op->otel_ctx = client_op->osd_parent_span->GetContext();
++    }
+   }
+   op->plan = op->get_write_plan(
+     sinfo,
+diff --git a/src/osd/ECCommonL.cc b/src/osd/ECCommonL.cc
+index da4cd6b35c7..a9254311117 100644
+--- a/src/osd/ECCommonL.cc
++++ b/src/osd/ECCommonL.cc
+@@ -932,6 +932,9 @@ bool ECCommonL::RMWPipeline::try_reads_to_commit()
+       r->map_epoch = get_osdmap_epoch();
+       r->min_epoch = get_parent()->get_interval_start_epoch();
+       r->trace = trace;
++      if (op->otel_ctx.IsValid()) {
++	r->otel_trace = op->otel_ctx;
++      }
+       messages.push_back(std::make_pair(i->osd, r));
+     }
+   }
+diff --git a/src/osd/ECCommonL.h b/src/osd/ECCommonL.h
+index d7994d27e7a..eb2dd667127 100644
+--- a/src/osd/ECCommonL.h
++++ b/src/osd/ECCommonL.h
+@@ -362,6 +362,7 @@ struct ECCommonL {
+       ceph_tid_t tid;
+       osd_reqid_t reqid;
+       ZTracer::Trace trace;
++      jspan_context otel_ctx{jspan_context::GetInvalid()};
+ 
+       /**
+        * pg_commited_to
