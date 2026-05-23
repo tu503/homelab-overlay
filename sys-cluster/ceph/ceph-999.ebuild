@@ -15,9 +15,9 @@ DESCRIPTION="Ceph distributed filesystem (homelab fork with OTLP tracing)"
 HOMEPAGE="https://ceph.com/"
 
 # Git source — configurable via env vars:
-#   CEPH666_FORK=tu503/ceph  CEPH666_BRANCH=ceph-666  emerge =sys-cluster/ceph-666
-EGIT_REPO_URI="https://github.com/${CEPH666_FORK:-tu503/ceph}.git"
-EGIT_BRANCH="${CEPH666_BRANCH:-ceph-666}"
+#   CEPH999_FORK=tu503/ceph  CEPH999_BRANCH=ceph-999  emerge =sys-cluster/ceph-999
+EGIT_REPO_URI="https://github.com/${CEPH999_FORK:-tu503/ceph}.git"
+EGIT_BRANCH="${CEPH999_BRANCH:-ceph-999}"
 
 # Parquet/arrow still fetched as tarballs
 SRC_URI="
@@ -220,7 +220,7 @@ PATCHES=(
 	"${FILESDIR}/ceph-18.2.4-spdk.patch"
 	"${FILESDIR}/ceph-19.2.1-isa-l.patch"
 	"${FILESDIR}/ceph-19.2.2-QATAPP-Fix-clang-16-compiling-issue.patch"
-	# OTLP patches not needed — already committed in the ceph-666 branch
+	# OTLP patches not needed — already committed in the ceph-999 branch
 	"${FILESDIR}/ceph-19.2.2-common-add-dependency-on-legacy-option-headers.patch"
 	"${FILESDIR}/ceph-19.2.2-rbd-make-enums-statically-castable.patch"
 	"${FILESDIR}/ceph-19.2.2-rgw-remove-FMT_STRING-to-fix-clang-20-build-failure.patch"

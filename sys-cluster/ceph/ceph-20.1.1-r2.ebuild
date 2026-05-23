@@ -233,7 +233,7 @@ PATCHES=(
 	"${FILESDIR}"/ceph-20.1.1-boost-1.89-{1,2,3}.patch
 	# Python 3.13 compat: PyO3 subinterpreter fix + prometheus logging bug
 	"${FILESDIR}/ceph-20.1.1-mgr-py313-compat.patch"
-	# OTel tracing instrumentation (ceph-666 branch patches)
+	# OTel tracing instrumentation (ceph-999 branch patches)
 	"${FILESDIR}/ceph-20.1.1-tracer-osd-rgw-spans.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-rgw-jspan-fix.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-mon-mds-instrument.patch"
