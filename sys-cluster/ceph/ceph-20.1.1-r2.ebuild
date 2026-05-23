@@ -244,6 +244,8 @@ PATCHES=(
 	"${FILESDIR}/ceph-20.1.1-bluestore-local-tracer.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-null-guard.patch"
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-trace-propagation.patch"
+	# Drop upload_id from multipart parent span name (cardinality bound)
+	"${FILESDIR}/ceph-20.1.1-rgw-multipart-span-name-fix.patch"
 	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 

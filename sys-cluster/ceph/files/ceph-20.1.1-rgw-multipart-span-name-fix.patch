@@ -1,0 +1,40 @@
+From: Chris Lu <lu@alcg.io>
+Date: Sat, 23 May 2026 16:30:00 -0400
+Subject: [PATCH] rgw: drop upload_id from multipart parent span name
+
+The multipart parent span was created with name() as its span name.
+For the multipart finalize path, name() returns
+"multipart_upload <upload_id>" — so every upload produces a unique
+span name. Downstream, Tempo's metrics-generator emits one
+Prometheus series per (service, span_name), so the
+traces_spanmetrics_* series count grows unbounded with the number
+of multipart uploads.
+
+The upload_id is already preserved as a span attribute on the
+request span (UPLOAD_ID, set on the line just above). Duplicate
+that attribute onto the multipart parent span and use a constant
+operation name so multipart_upload aggregates into a single series.
+This preserves TraceQL filtering by upload_id while bounding
+prometheus cardinality to op-type granularity.
+
+Signed-off-by: Chris Lu <lu@alcg.io>
+---
+ src/rgw/rgw_op.cc | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/rgw/rgw_op.cc b/src/rgw/rgw_op.cc
+--- a/src/rgw/rgw_op.cc
++++ b/src/rgw/rgw_op.cc
+@@ -4459,7 +4459,10 @@ void RGWPutObj::execute(optional_yield y)
+
+     s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, multipart_upload_id);
+-    multipart_trace = tracing::rgw::tracer.add_span(name(), upload->get_trace());
++    multipart_trace = tracing::rgw::tracer.add_span("multipart_upload", upload->get_trace());
++    if (multipart_trace) {
++      multipart_trace->SetAttribute(tracing::rgw::UPLOAD_ID, multipart_upload_id);
++    }
+     // propagate multipart trace context so RADOS data writes link to
+     // the multipart upload trace rather than the ephemeral request trace
+     if (multipart_trace && multipart_trace->IsRecording()) {
+--
+2.52.0

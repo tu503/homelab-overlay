@@ -220,7 +220,9 @@ PATCHES=(
 	"${FILESDIR}/ceph-18.2.4-spdk.patch"
 	"${FILESDIR}/ceph-19.2.1-isa-l.patch"
 	"${FILESDIR}/ceph-19.2.2-QATAPP-Fix-clang-16-compiling-issue.patch"
-	# OTLP patches not needed — already committed in the ceph-999 branch
+	# OTLP patches not needed — already committed in the ceph-999 branch,
+	# except this cardinality fix landed after the branch was last rebased
+	"${FILESDIR}/ceph-20.1.1-rgw-multipart-span-name-fix.patch"
 	"${FILESDIR}/ceph-19.2.2-common-add-dependency-on-legacy-option-headers.patch"
 	"${FILESDIR}/ceph-19.2.2-rbd-make-enums-statically-castable.patch"
 	"${FILESDIR}/ceph-19.2.2-rgw-remove-FMT_STRING-to-fix-clang-20-build-failure.patch"
