@@ -260,6 +260,10 @@ PATCHES=(
 	# BatchSpanProcessor) + downstream build fixes (KStore::read signature,
 	# ECSwitch override, PrimaryLogPG jspan_context default-ctor + ctx vs op)
 	"${FILESDIR}/ceph-20.1.1-tracer-share-provider-build-fixes.patch"
+	# Thread RGW request's jspan_context all the way down to MOSDOp.otel_trace
+	# (librados_asio.h async_operate, rgw_aio, rgw_rados, rgw_sal Params)
+	# so GET traces link rgw -> osd -> bluestore on replicated pools
+	"${FILESDIR}/ceph-20.1.1-rgw-get-trace-propagation.patch"
 	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 
