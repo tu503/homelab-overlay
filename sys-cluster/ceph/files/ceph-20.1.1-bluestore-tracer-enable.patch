@@ -1,0 +1,81 @@
+From: Chris Lu <lu@alcg.io>
+Date: Sat, 23 May 2026 18:30:00 -0400
+Subject: [PATCH] bluestore: initialize tracer + add read-path spans
+
+ceph-20.1.1-bluestore-local-tracer.patch (PATCH 09/10) introduced a
+new tracing::bluestore::tracer global to make the os library
+self-contained (so ceph-bluestore-tool can link without OSD
+symbols), and redirected the two existing call sites in BlueStore.cc
+(queue_transactions, txc_aio_wait) from tracing::osd::tracer to the
+new tracer. That fixed the link error but never wired an exporter
+to the bluestore tracer, so those spans have been silently dropping
+since the patch landed. nm shows the symbol is in /usr/bin/ceph-osd
+but its internal OTLP provider is null, and add_span returns a
+no-op span.
+
+Fix by initializing the bluestore tracer alongside the osd tracer
+in OSD::init(). Each Tracer instance gets its own provider with its
+own resource (service.name=bluestore), so bluestore spans show up
+as a distinct service in Tempo and contribute their own
+traces_spanmetrics_* series.
+
+Also add a "bluestore_read" span at the entry of BlueStore::read()
+to give GET-path observability. The librados public API has no
+IoCtx::operate(ObjectReadOperation*, ..., jspan_context*) overload,
+so RGW GET requests can't carry trace context down to the OSD/store.
+Until that's fixed, bluestore_read spans are orphan traces — they
+still emit Prometheus span metrics (latency histograms per OSD) and
+are searchable in Tempo, just not linked under the parent RGW GET
+trace. Tagging offset/length as span attributes so TraceQL can
+filter by request size.
+
+Two known follow-ups:
+  * Add IoCtx::operate / aio_operate overloads accepting
+    jspan_context* for ObjectReadOperation, thread through Objecter
+    and MOSDOp, so reads carry trace context end-to-end.
+  * Add an _do_read child span inside BlueStore::read to split
+    onode-load latency from the actual data read.
+
+Signed-off-by: Chris Lu <lu@alcg.io>
+---
+ src/osd/OSD.cc                 | 2 ++
+ src/os/bluestore/BlueStore.cc  | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/osd/OSD.cc b/src/osd/OSD.cc
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -66,6 +66,7 @@
+ #include "os/ObjectStore.h"
+
+ #include "os/FuseStore.h"
++#include "os/bluestore/bluestore_tracer.h"
+
+ #include "PrimaryLogPG.h"
+
+@@ -3744,6 +3745,7 @@ int OSD::init()
+   if (is_stopping())
+     return 0;
+   tracing::osd::tracer.init(cct, "osd", std::to_string(whoami));
++  tracing::bluestore::tracer.init(cct, "bluestore", std::to_string(whoami));
+   tick_timer.init();
+   tick_timer_without_osd_lock.init();
+   service.recovery_request_timer.init();
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -12449,6 +12449,12 @@ int BlueStore::read(
+   bufferlist& bl,
+   uint32_t op_flags)
+ {
++  auto read_span = tracing::bluestore::tracer.start_trace("bluestore_read");
++  if (read_span->IsRecording()) {
++    read_span->SetAttribute("offset", (int64_t)offset);
++    read_span->SetAttribute("length", (int64_t)length);
++    read_span->SetAttribute("op_flags", (int64_t)op_flags);
++  }
+   auto start = mono_clock::now();
+   Collection *c = static_cast<Collection *>(c_.get());
+   const coll_t &cid = c->get_cid();
+--
+2.52.0

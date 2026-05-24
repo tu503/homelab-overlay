@@ -242,6 +242,9 @@ PATCHES=(
 	"${FILESDIR}/ceph-20.1.1-bluestore-jspan-reset-fix.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-jspan-default-ctor.patch"
 	"${FILESDIR}/ceph-20.1.1-bluestore-local-tracer.patch"
+	# Initialize bluestore tracer + add read-path spans (otherwise the
+	# local-tracer patch above leaves queue_transactions/txc_aio_wait as no-ops)
+	"${FILESDIR}/ceph-20.1.1-bluestore-tracer-enable.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-null-guard.patch"
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-trace-propagation.patch"
 	# Drop upload_id from multipart parent span name (cardinality bound)
