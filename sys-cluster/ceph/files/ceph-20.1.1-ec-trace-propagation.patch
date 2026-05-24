@@ -1,0 +1,467 @@
+From 2111206d74a2eac12e824982391046400688e078 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 16:12:20 -0400
+Subject: [PATCH] ec: propagate OTel parent trace context through EC read
+ pipeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds end-to-end propagation of jspan_context from RGW GET through
+ECBackend to peer-OSD shard reads and BlueStore. Mirrors the existing
+write-path machinery (RMWPipeline::Op already carries jspan_context).
+
+Wire-format change:
+  * MOSDECSubOpRead bumps HEAD_VERSION 3 -> 4 and encodes/decodes
+    otel_trace alongside the existing blkin trace. Older OSDs that
+    speak v3 ignore the field; v4+ peers pick it up via the generic
+    OSD::dispatch path (OSD.cc:7753 already sets
+    op->osd_parent_span from m->otel_trace for any incoming message).
+
+API plumbing:
+  * PGBackend::objects_read_async virtual gains an optional
+    const jspan_context *parent_trace = nullptr.
+  * ECSwitch::objects_read_async forwards parent_trace to ECBackend
+    (optimized backend) and drops it for ECBackendL (legacy backend
+    keeps its 5-arg form — propagation through ECBackendL's read
+    pipeline is a separate effort).
+  * ECBackend::objects_read_async -> objects_read_and_reconstruct
+    -> read_pipeline.objects_read_and_reconstruct -> start_read_op
+    threads parent_trace down to ReadOp.otel_ctx (new field that
+    mirrors WriteOp::Op::otel_ctx).
+  * ECCommon::ReadPipeline at the MOSDECSubOpRead build site sets
+    msg->otel_trace = rop.otel_ctx so the peer OSD picks it up.
+  * ECBackend::handle_sub_read gains a parent_trace param that the
+    dispatcher derives from _op->osd_parent_span; the 2 local
+    store->read sites for own-shard reads now pass parent_trace.
+  * ReplicatedBackend::objects_read_async accepts parent_trace
+    (signature-only, no behavior change — its sync path already
+    propagates via objects_read_sync from the bluestore-read-subspans
+    patch).
+  * PrimaryLogPG::OpContext::start_async_reads materializes
+    op->osd_parent_span->GetContext() and passes its address to
+    pgbackend->objects_read_async.
+
+Status: code is in place. End-to-end Tempo verification is pending
+investigation of Tempo's WAL->block flush behavior — the cluster's
+tempo instance currently shows total_blocks=0 in search responses,
+so trace fragments visible via /api/traces/<id> aren't reliably
+aggregating across services. Code review is welcome; behavior
+verification will follow once Tempo is healthy.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/messages/MOSDECSubOpRead.h |  6 +++++-
+ src/osd/ECBackend.cc           | 35 ++++++++++++++++++++++++----------
+ src/osd/ECBackend.h            | 12 ++++++++----
+ src/osd/ECCommon.cc            | 21 +++++++++++++++-----
+ src/osd/ECCommon.h             | 16 +++++++++++-----
+ src/osd/ECSwitch.h             |  7 +++++--
+ src/osd/PGBackend.h            |  3 ++-
+ src/osd/PrimaryLogPG.cc        | 14 +++++++++++---
+ src/osd/ReplicatedBackend.cc   |  3 ++-
+ src/osd/ReplicatedBackend.h    |  3 ++-
+ 10 files changed, 87 insertions(+), 33 deletions(-)
+
+diff --git a/src/messages/MOSDECSubOpRead.h b/src/messages/MOSDECSubOpRead.h
+index 254357f..4a1095b 100644
+--- a/src/messages/MOSDECSubOpRead.h
++++ b/src/messages/MOSDECSubOpRead.h
+@@ -20,7 +20,7 @@
+ 
+ class MOSDECSubOpRead : public MOSDFastDispatchOp {
+ private:
+-  static constexpr int HEAD_VERSION = 3;
++  static constexpr int HEAD_VERSION = 4;
+   static constexpr int COMPAT_VERSION = 1;
+ 
+ public:
+@@ -57,6 +57,9 @@ public:
+     } else {
+       min_epoch = map_epoch;
+     }
++    if (header.version >= 4) {
++      decode_otel_trace(p);
++    }
+   }
+ 
+   void encode_payload(uint64_t features) override {
+@@ -66,6 +69,7 @@ public:
+     encode(op, payload, features);
+     encode(min_epoch, payload);
+     encode_trace(payload, features);
++    encode_otel_trace(payload, features);
+   }
+ 
+   std::string_view get_type_name() const override { return "MOSDECSubOpRead"; }
+diff --git a/src/osd/ECBackend.cc b/src/osd/ECBackend.cc
+index 64e7742..493d73c 100644
+--- a/src/osd/ECBackend.cc
++++ b/src/osd/ECBackend.cc
+@@ -278,7 +278,17 @@ bool ECBackend::_handle_message(
+     reply->pgid = get_parent()->primary_spg_t();
+     reply->map_epoch = switcher->get_osdmap_epoch();
+     reply->min_epoch = get_parent()->get_interval_start_epoch();
+-    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace);
++    {
++      // pull parent OTel context from incoming op_request (set by OSD dispatch
++      // from MOSDECSubOpRead.otel_trace) so local store->read links to RGW GET
++      jspan_context sub_read_parent{false, false};
++      const jspan_context *sub_read_parent_ptr = nullptr;
++      if (_op->osd_parent_span) {
++        sub_read_parent = _op->osd_parent_span->GetContext();
++        if (sub_read_parent.IsValid()) sub_read_parent_ptr = &sub_read_parent;
++      }
++      handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace, sub_read_parent_ptr);
++    }
+     reply->trace = _op->pg_trace;
+     get_parent()->send_message_osd_cluster(
+       reply, _op->get_req()->get_connection());
+@@ -482,7 +492,8 @@ void ECBackend::handle_sub_read(
+   pg_shard_t from,
+   const ECSubRead &op,
+   ECSubReadReply *reply,
+-  const ZTracer::Trace &trace) {
++  const ZTracer::Trace &trace,
++  const jspan_context *parent_trace) {
+   trace.event("handle sub read");
+   shard_id_t shard = get_parent()->whoami_shard().shard;
+   for (auto &&[hoid, to_read]: op.to_read) {
+@@ -496,7 +507,7 @@ void ECBackend::handle_sub_read(
+         r = switcher->store->read(
+           switcher->ch,
+           ghobject_t(hoid, ghobject_t::NO_GEN, shard),
+-          offset, len, bl, flags); // Allow EIO return
++          offset, len, bl, flags, parent_trace); // Allow EIO return
+       } else {
+         int subchunk_size =
+           sinfo.get_chunk_size() / ec_impl->get_sub_chunk_count();
+@@ -513,7 +524,7 @@ void ECBackend::handle_sub_read(
+               ghobject_t(hoid, ghobject_t::NO_GEN, shard),
+               offset + m + (k.first) * subchunk_size,
+               (k.second) * subchunk_size,
+-              bl0, flags);
++              bl0, flags, parent_trace);
+             if (r < 0) {
+               error = true;
+               break;
+@@ -1017,7 +1028,8 @@ void ECBackend::objects_read_async(
+     const list<pair<ec_align_t,
+                     pair<bufferlist*, Context*>>> &to_read,
+     Context *on_complete,
+-    bool fast_read) {
++    bool fast_read,
++    const jspan_context *parent_trace) {
+   map<hobject_t, std::list<ec_align_t>> reads;
+ 
+   uint32_t flags = 0;
+@@ -1123,23 +1135,26 @@ void ECBackend::objects_read_async(
+       cb(this,
+          hoid,
+          to_read,
+-         on_complete)));
++         on_complete)),
++    parent_trace);
+ }
+ 
+ void ECBackend::objects_read_and_reconstruct(
+   const map<hobject_t, std::list<ec_align_t>> &reads,
+   bool fast_read,
+   uint64_t object_size,
+-  GenContextURef<ECCommon::ec_extents_t&&> &&func) {
++  GenContextURef<ECCommon::ec_extents_t&&> &&func,
++  const jspan_context *parent_trace) {
+   return read_pipeline.objects_read_and_reconstruct(
+-    reads, fast_read, object_size, std::move(func));
++    reads, fast_read, object_size, std::move(func), parent_trace);
+ }
+ 
+ void ECBackend::objects_read_and_reconstruct_for_rmw(
+   map<hobject_t, read_request_t> &&to_read,
+-  GenContextURef<ECCommon::ec_extents_t&&> &&func) {
++  GenContextURef<ECCommon::ec_extents_t&&> &&func,
++  const jspan_context *parent_trace) {
+   return read_pipeline.objects_read_and_reconstruct_for_rmw(
+-    std::move(to_read), std::move(func));
++    std::move(to_read), std::move(func), parent_trace);
+ }
+ 
+ void ECBackend::kick_reads() {
+diff --git a/src/osd/ECBackend.h b/src/osd/ECBackend.h
+index 4d116a5..769b9d9 100644
+--- a/src/osd/ECBackend.h
++++ b/src/osd/ECBackend.h
+@@ -80,7 +80,8 @@ class ECBackend : public ECCommon {
+       pg_shard_t from,
+       const ECSubRead &op,
+       ECSubReadReply *reply,
+-      const ZTracer::Trace &trace
++      const ZTracer::Trace &trace,
++      const jspan_context *parent_trace = nullptr
+     );
+   void handle_sub_read_n_reply(
+     pg_shard_t from,
+@@ -159,7 +160,8 @@ class ECBackend : public ECCommon {
+       const std::map<hobject_t, std::list<ec_align_t>> &reads,
+       bool fast_read,
+       uint64_t object_size,
+-      GenContextURef<ECCommon::ec_extents_t&&> &&func
++      GenContextURef<ECCommon::ec_extents_t&&> &&func,
++      const jspan_context *parent_trace = nullptr
+     ) override;
+ 
+   /**
+@@ -171,7 +173,8 @@ class ECBackend : public ECCommon {
+    */
+   void objects_read_and_reconstruct_for_rmw(
+       std::map<hobject_t, read_request_t> &&reads,
+-      GenContextURef<ECCommon::ec_extents_t&&> &&func
++      GenContextURef<ECCommon::ec_extents_t&&> &&func,
++      const jspan_context *parent_trace = nullptr
+     ) override;
+ 
+   void objects_read_async(
+@@ -181,7 +184,8 @@ class ECBackend : public ECCommon {
+                                 std::pair<ceph::buffer::list*, Context*>>> &
+       to_read,
+       Context *on_complete,
+-      bool fast_read = false
++      bool fast_read = false,
++      const jspan_context *parent_trace = nullptr
+     );
+ 
+  private:
+diff --git a/src/osd/ECCommon.cc b/src/osd/ECCommon.cc
+index 5c1d1af..23de3e7 100644
+--- a/src/osd/ECCommon.cc
++++ b/src/osd/ECCommon.cc
+@@ -434,7 +434,8 @@ void ECCommon::ReadPipeline::start_read_op(
+     map<hobject_t, read_request_t> &to_read,
+     const bool do_redundant_reads,
+     const bool for_recovery,
+-    std::unique_ptr<ReadCompleter> on_complete) {
++    std::unique_ptr<ReadCompleter> on_complete,
++    const jspan_context *parent_trace) {
+   ceph_tid_t tid = get_parent()->get_tid();
+   ceph_assert(!tid_to_read_map.contains(tid));
+   auto &op = tid_to_read_map.emplace(
+@@ -446,6 +447,9 @@ void ECCommon::ReadPipeline::start_read_op(
+       for_recovery,
+       std::move(on_complete),
+       std::move(to_read))).first->second;
++  if (parent_trace && parent_trace->IsValid()) {
++    op.otel_ctx = *parent_trace;
++  }
+   dout(10) << __func__ << ": starting " << op << dendl;
+   if (op.op) {
+ #ifndef WITH_CRIMSON
+@@ -517,6 +521,9 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
+     msg->op = read;
+     msg->op.from = get_parent()->whoami_shard();
+     msg->op.tid = tid;
++    if (rop.otel_ctx.IsValid()) {
++      msg->otel_trace = jspan_context(rop.otel_ctx);
++    }
+     if (rop.trace) {
+       // initialize a child span for this shard
+       msg->trace.init("ec sub read", nullptr, &rop.trace);
+@@ -625,7 +632,8 @@ void ECCommon::ReadPipeline::objects_read_and_reconstruct(
+     const map<hobject_t, std::list<ec_align_t>> &reads,
+     const bool fast_read,
+     const uint64_t object_size,
+-    GenContextURef<ec_extents_t&&> &&func) {
++    GenContextURef<ec_extents_t&&> &&func,
++    const jspan_context *parent_trace) {
+   in_progress_client_reads.emplace_back(reads.size(), std::move(func));
+   if (!reads.size()) {
+     kick_reads();
+@@ -661,12 +669,14 @@ void ECCommon::ReadPipeline::objects_read_and_reconstruct(
+     fast_read,
+     false,
+     std::make_unique<ClientReadCompleter>(
+-      *this, &(in_progress_client_reads.back())));
++      *this, &(in_progress_client_reads.back())),
++    parent_trace);
+ }
+ 
+ void ECCommon::ReadPipeline::objects_read_and_reconstruct_for_rmw(
+     map<hobject_t, read_request_t> &&to_read,
+-    GenContextURef<ec_extents_t&&> &&func) {
++    GenContextURef<ec_extents_t&&> &&func,
++    const jspan_context *parent_trace) {
+   in_progress_client_reads.emplace_back(to_read.size(), std::move(func));
+   if (!to_read.size()) {
+     kick_reads();
+@@ -693,7 +703,8 @@ void ECCommon::ReadPipeline::objects_read_and_reconstruct_for_rmw(
+     CEPH_MSG_PRIO_DEFAULT,
+     for_read_op, false, false,
+     std::make_unique<ClientReadCompleter>(
+-      *this, &(in_progress_client_reads.back())));
++      *this, &(in_progress_client_reads.back())),
++    parent_trace);
+ }
+ 
+ 
+diff --git a/src/osd/ECCommon.h b/src/osd/ECCommon.h
+index 2eaf30f..0e9ec73 100644
+--- a/src/osd/ECCommon.h
++++ b/src/osd/ECCommon.h
+@@ -90,7 +90,8 @@ struct ECCommon {
+       const std::map<hobject_t, std::list<ec_align_t>> &reads,
+       bool fast_read,
+       uint64_t object_size,
+-      GenContextURef<ec_extents_t&&> &&func) = 0;
++      GenContextURef<ec_extents_t&&> &&func,
++      const jspan_context *parent_trace = nullptr) = 0;
+ 
+   struct shard_read_t {
+     extent_set extents;
+@@ -150,7 +151,8 @@ struct ECCommon {
+ 
+   virtual void objects_read_and_reconstruct_for_rmw(
+       std::map<hobject_t, read_request_t> &&to_read,
+-      GenContextURef<ec_extents_t&&> &&func) = 0;
++      GenContextURef<ec_extents_t&&> &&func,
++      const jspan_context *parent_trace = nullptr) = 0;
+ 
+   struct ReadOp;
+   /**
+@@ -259,6 +261,7 @@ struct ECCommon {
+     std::unique_ptr<ReadCompleter> on_complete;
+ 
+     ZTracer::Trace trace;
++    jspan_context otel_ctx{jspan_context::GetInvalid()};
+ 
+     std::map<hobject_t, read_request_t> to_read;
+     std::map<hobject_t, read_result_t> complete;
+@@ -311,11 +314,13 @@ struct ECCommon {
+         const std::map<hobject_t, std::list<ec_align_t>> &reads,
+         bool fast_read,
+         uint64_t object_size,
+-        GenContextURef<ec_extents_t&&> &&func);
++        GenContextURef<ec_extents_t&&> &&func,
++        const jspan_context *parent_trace = nullptr);
+ 
+     void objects_read_and_reconstruct_for_rmw(
+         std::map<hobject_t, read_request_t> &&to_read,
+-        GenContextURef<ECCommon::ec_extents_t&&> &&func);
++        GenContextURef<ECCommon::ec_extents_t&&> &&func,
++        const jspan_context *parent_trace = nullptr);
+ 
+     template <class F, class G>
+     void filter_read_op(
+@@ -337,7 +342,8 @@ struct ECCommon {
+         std::map<hobject_t, read_request_t> &to_read,
+         bool do_redundant_reads,
+         bool for_recovery,
+-        std::unique_ptr<ReadCompleter> on_complete);
++        std::unique_ptr<ReadCompleter> on_complete,
++        const jspan_context *parent_trace = nullptr);
+ 
+     void do_read_op(ReadOp &rop);
+ 
+diff --git a/src/osd/ECSwitch.h b/src/osd/ECSwitch.h
+index be264dd..6a5e146 100644
+--- a/src/osd/ECSwitch.h
++++ b/src/osd/ECSwitch.h
+@@ -277,13 +277,16 @@ public:
+     const std::list<std::pair<ec_align_t,
+                               std::pair<ceph::buffer::list*, Context*>>> &
+     to_read,
+-    Context *on_complete, bool fast_read = false) override
++    Context *on_complete, bool fast_read = false,
++    const jspan_context *parent_trace = nullptr) override
+   {
+     if (is_optimized()) {
+       optimized.objects_read_async(hoid, object_size, to_read, on_complete,
+-                                   fast_read);
++                                   fast_read, parent_trace);
+     }
+     else {
++      // legacy EC backend (ECBackendL) doesn't accept parent_trace yet
++      (void)parent_trace;
+       legacy.objects_read_async(hoid, object_size, to_read, on_complete,
+                                 fast_read);
+     }
+diff --git a/src/osd/PGBackend.h b/src/osd/PGBackend.h
+index f306a3a..fb058f4 100644
+--- a/src/osd/PGBackend.h
++++ b/src/osd/PGBackend.h
+@@ -608,7 +608,8 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
+      uint64_t object_size,
+      const std::list<std::pair<ec_align_t,
+ 		std::pair<ceph::buffer::list*, Context*>>> &to_read,
+-     Context *on_complete, bool fast_read = false) = 0;
++     Context *on_complete, bool fast_read = false,
++     const jspan_context *parent_trace = nullptr) = 0;
+ 
+    virtual bool auto_repair_supported() const = 0;
+ 
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+index de00ff2..50a79a5 100644
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -306,11 +306,18 @@ void PrimaryLogPG::OpContext::start_async_reads(PrimaryLogPG *pg)
+       },
+       std::move(ctx_pair));
+   }
++  jspan_context oar_parent{false, false};
++  const jspan_context *oar_parent_ptr = nullptr;
++  if (op && op->osd_parent_span) {
++    oar_parent = op->osd_parent_span->GetContext();
++    if (oar_parent.IsValid()) oar_parent_ptr = &oar_parent;
++  }
+   pg->pgbackend->objects_read_async(
+     obc->obs.oi.soid,
+     obc->obs.oi.size,
+     in_native,
+-    new OnReadComplete(pg, this), pg->get_pool().fast_read);
++    new OnReadComplete(pg, this), pg->get_pool().fast_read,
++    oar_parent_ptr);
+ }
+ void PrimaryLogPG::OpContext::finish_read(PrimaryLogPG *pg)
+ {
+@@ -10713,9 +10720,10 @@ int PrimaryLogPG::do_cdc(const object_info_t& oi,
+    * Therefore, we should change the current implementation totally to make EC pool compatible. 
+    * As s result, we leave this as a future work.
+    */
+-  // dedup base-read context has no OpRequest in scope; orphan trace for now
++  const jspan_context *dedup_parent_ptr = nullptr;
++  jspan_context dedup_parent = jspan_context{false, false};
+   int r = pgbackend->objects_read_sync(
+-      oi.soid, 0, oi.size, 0, &bl, nullptr);
++      oi.soid, 0, oi.size, 0, &bl, dedup_parent_ptr);
+   if (r < 0) {
+     dout(0) << __func__ << " read fail " << oi.soid
+             << " len: " << oi.size << " r: " << r << dendl;
+diff --git a/src/osd/ReplicatedBackend.cc b/src/osd/ReplicatedBackend.cc
+index b8bfc72..79d62bc 100644
+--- a/src/osd/ReplicatedBackend.cc
++++ b/src/osd/ReplicatedBackend.cc
+@@ -306,7 +306,8 @@ void ReplicatedBackend::objects_read_async(
+   const list<pair<ec_align_t,
+ 		  pair<bufferlist*, Context*> > > &to_read,
+   Context *on_complete,
+-  bool fast_read)
++  bool fast_read,
++  const jspan_context *parent_trace)
+ {
+   ceph_abort_msg("async read is not used by replica pool");
+ }
+diff --git a/src/osd/ReplicatedBackend.h b/src/osd/ReplicatedBackend.h
+index b26ff64..3d0ffc0 100644
+--- a/src/osd/ReplicatedBackend.h
++++ b/src/osd/ReplicatedBackend.h
+@@ -153,7 +153,8 @@ public:
+     const std::list<std::pair<ec_align_t,
+ 	       std::pair<ceph::buffer::list*, Context*> > > &to_read,
+                Context *on_complete,
+-               bool fast_read = false) override;
++               bool fast_read = false,
++               const jspan_context *parent_trace = nullptr) override;
+ 
+ private:
+   // push
+-- 
+2.53.0
+
