@@ -1,0 +1,242 @@
+From e8624c5a13442fa538b85a96de98e90d1c152c73 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 11:13:03 -0400
+Subject: [PATCH] tracer: share single TracerProvider across osd+bluestore +
+ fix downstream build errors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Splits into one logical fix-up commit covering everything I missed in
+the first four patches of the read-path trace coverage series:
+
+1. tracing::Tracer::init_from_global() — opentelemetry-cpp 1.24's
+   BatchSpanProcessor is shutdown when SetTracerProvider() replaces
+   the global. With two Tracer::init() calls in one process (osd then
+   bluestore), the OSD tracer's exporter stopped working — TCP socket
+   stayed open but no spans flushed. Add init_from_global() which
+   reads the already-set global provider and grabs a Tracer with our
+   own scope name, sharing the single exporter. OSD.cc now uses this
+   for bluestore::tracer.
+
+   Net effect: PUT traces fan out to rgw -> op-request-created
+   -> dequeue_op -> do_op -> execute_ctx -> queue_transactions
+   -> txc_aio_wait, all under service.name=osd but with distinct
+   instrumentation scope names. GET traces produce orphan bluestore
+   spans (bluestore_read / get_onode / _do_read) attributable via
+   Prometheus span_metrics but not yet linked under the RGW GET
+   trace — that path uses a different librados entry point not
+   covered by the earlier librados-read-trace patch.
+
+2. KStore::read signature — match the ObjectStore::read virtual
+   change from the bluestore-read-subspans patch. KStore is built
+   when WITH_KSTORE is on; without this, the build failed on the
+   'override' mismatch.
+
+3. ECSwitch::objects_read_sync — match the PGBackend virtual
+   signature. The EC backends themselves (ECBackend, ECLegacy::
+   ECBackendL) keep their existing 5-arg form; ECSwitch accepts the
+   new parent_trace param but drops it before delegating. EC reads
+   stay un-propagated to BlueStore until those backends are updated
+   separately.
+
+4. PrimaryLogPG.cc call sites — fix two issues with my originals:
+     - jspan_context (= opentelemetry::trace::SpanContext) has no
+       default constructor; replace 'jspan_context x;' with
+       'jspan_context x{false, false};' (matches the existing
+       tracer-rgw-jspan-fix pattern).
+     - The hit-set-archive site has 'op' in scope (not 'ctx'), and
+       the dedup base read has neither — use the correct identifiers
+       or pass nullptr where neither is available.
+
+After these fixes the build links clean, OSDs come up with both
+provider scopes wired through a single OTLP exporter, and trace
+search shows the full PUT fanout (~150 spans / object for EC 7+2).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/common/tracer.cc    | 10 ++++++++++
+ src/common/tracer.h     |  6 ++++++
+ src/os/kstore/KStore.cc |  3 ++-
+ src/os/kstore/KStore.h  |  3 ++-
+ src/osd/ECSwitch.h      |  7 ++++++-
+ src/osd/OSD.cc          |  5 ++++-
+ src/osd/PrimaryLogPG.cc | 36 ++++++++++++++----------------------
+ 7 files changed, 44 insertions(+), 26 deletions(-)
+
+diff --git a/src/common/tracer.cc b/src/common/tracer.cc
+index 0dd2ec8..326a6b6 100644
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
+@@ -58,6 +58,16 @@ void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_n
+   }
+ }
+ 
++void Tracer::init_from_global(CephContext* _cct, opentelemetry::nostd::string_view scope_name) {
++  ceph_assert(_cct);
++  cct = _cct;
++  if (!tracer) {
++    ldout(cct, 3) << "binding tracer scope '" << scope_name << "' to global provider" << dendl;
++    auto provider = opentelemetry::trace::Provider::GetTracerProvider();
++    tracer = provider->GetTracer(scope_name, OPENTELEMETRY_SDK_VERSION);
++  }
++}
++
+ jspan_ptr Tracer::start_trace(opentelemetry::nostd::string_view trace_name) {
+   ceph_assert(cct);
+   if (is_enabled()) {
+diff --git a/src/common/tracer.h b/src/common/tracer.h
+index 38e17b3..12bccd8 100644
+--- a/src/common/tracer.h
++++ b/src/common/tracer.h
+@@ -38,6 +38,12 @@ class Tracer {
+             opentelemetry::nostd::string_view instance_id = "",
+             const std::map<std::string, std::string>& extra_attrs = {});
+ 
++  // Get a tracer from the GLOBAL provider (set by another tracer.init() earlier
++  // in the same process). Use this when multiple tracers in one process need
++  // to share the same exporter so SetTracerProvider doesn't clobber the first.
++  void init_from_global(CephContext* _cct, opentelemetry::nostd::string_view scope_name);
++
++
+   bool is_enabled() const;
+   // creates and returns a new span with `trace_name`
+   // this span represents a trace, since it has no parent.
+diff --git a/src/os/kstore/KStore.cc b/src/os/kstore/KStore.cc
+index 12cf6f6..d5b07b1 100644
+--- a/src/os/kstore/KStore.cc
++++ b/src/os/kstore/KStore.cc
+@@ -1180,7 +1180,8 @@ int KStore::read(
+   uint64_t offset,
+   size_t length,
+   bufferlist& bl,
+-  uint32_t op_flags)
++  uint32_t op_flags,
++  const jspan_context *parent_trace)
+ {
+   dout(15) << __func__ << " " << ch->cid << " " << oid
+ 	   << " " << offset << "~" << length
+diff --git a/src/os/kstore/KStore.h b/src/os/kstore/KStore.h
+index 81b9a0c..94d5a0a 100644
+--- a/src/os/kstore/KStore.h
++++ b/src/os/kstore/KStore.h
+@@ -457,7 +457,8 @@ public:
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+-    uint32_t op_flags = 0) override;
++    uint32_t op_flags = 0,
++    const jspan_context *parent_trace = nullptr) override;
+   int _do_read(
+     OnodeRef o,
+     uint64_t offset,
+diff --git a/src/osd/ECSwitch.h b/src/osd/ECSwitch.h
+index 42f4050..be264dd 100644
+--- a/src/osd/ECSwitch.h
++++ b/src/osd/ECSwitch.h
+@@ -258,8 +258,13 @@ public:
+   }
+ 
+   int objects_read_sync(const hobject_t &hoid, uint64_t off, uint64_t len,
+-                        uint32_t op_flags, ceph::buffer::list *bl) override
++                        uint32_t op_flags, ceph::buffer::list *bl,
++                        const jspan_context *parent_trace = nullptr) override
+   {
++    // EC backends don't currently propagate the parent trace down to the
++    // ObjectStore; drop it here so the signature matches their existing
++    // 5-arg form. EC reads will surface bluestore_read as orphan traces.
++    (void)parent_trace;
+     if (is_optimized()) {
+       return optimized.objects_read_sync(hoid, off, len, op_flags, bl);
+     }
+diff --git a/src/osd/OSD.cc b/src/osd/OSD.cc
+index 074cb62..e1b53ea 100644
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -3746,7 +3746,10 @@ int OSD::init()
+   if (is_stopping())
+     return 0;
+   tracing::osd::tracer.init(cct, "osd", std::to_string(whoami));
+-  tracing::bluestore::tracer.init(cct, "bluestore", std::to_string(whoami));
++  // Share the OSD daemon's OTLP exporter; calling .init() would call
++  // SetTracerProvider again and shut down the OSD tracer's batch processor
++  // in opentelemetry-cpp 1.24.
++  tracing::bluestore::tracer.init_from_global(cct, "bluestore");
+   tick_timer.init();
+   tick_timer_without_osd_lock.init();
+   service.recovery_request_timer.init();
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+index 46933a1..de00ff2 100644
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -1611,12 +1611,11 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op)
+ 	    wait_for_unreadable_object(oid, op);
+ 	    return;
+ 	  }
+-	  jspan_context hsa_parent;
+ 	  const jspan_context *hsa_parent_ptr = nullptr;
+-	  if (ctx->op && ctx->op->osd_parent_span) {
+-	    hsa_parent = ctx->op->osd_parent_span->GetContext();
+-	    if (hsa_parent.IsValid()) hsa_parent_ptr = &hsa_parent;
+-	  }
++	  jspan_context hsa_parent = (op && op->osd_parent_span)
++	    ? op->osd_parent_span->GetContext()
++	    : jspan_context{false, false};
++	  if (hsa_parent.IsValid()) hsa_parent_ptr = &hsa_parent;
+ 	  result = osd->store->read(ch, ghobject_t(oid), 0, 0, osd_op.outdata, 0, hsa_parent_ptr);
+ 	}
+       }
+@@ -5911,12 +5910,11 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
+     ctx->op_finishers[ctx->current_osd_subop_num].reset(
+       new ReadFinisher(osd_op));
+   } else {
+-    jspan_context read_parent;
+     const jspan_context *read_parent_ptr = nullptr;
+-    if (ctx->op && ctx->op->osd_parent_span) {
+-      read_parent = ctx->op->osd_parent_span->GetContext();
+-      if (read_parent.IsValid()) read_parent_ptr = &read_parent;
+-    }
++    jspan_context read_parent = (ctx->op && ctx->op->osd_parent_span)
++      ? ctx->op->osd_parent_span->GetContext()
++      : jspan_context{false, false};
++    if (read_parent.IsValid()) read_parent_ptr = &read_parent;
+     int r = pgbackend->objects_read_sync(
+       soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata, read_parent_ptr);
+     // whole object?  can we verify the checksum?
+@@ -9400,12 +9398,11 @@ int PrimaryLogPG::do_copy_get(OpContext *ctx, bufferlist::const_iterator& bp,
+ 
+ 	dout(10) << __func__ << ": async_read noted for " << soid << dendl;
+       } else {
+-	jspan_context chunk_parent;
+ 	const jspan_context *chunk_parent_ptr = nullptr;
+-	if (ctx->op && ctx->op->osd_parent_span) {
+-	  chunk_parent = ctx->op->osd_parent_span->GetContext();
+-	  if (chunk_parent.IsValid()) chunk_parent_ptr = &chunk_parent;
+-	}
++	jspan_context chunk_parent = (ctx->op && ctx->op->osd_parent_span)
++	  ? ctx->op->osd_parent_span->GetContext()
++	  : jspan_context{false, false};
++	if (chunk_parent.IsValid()) chunk_parent_ptr = &chunk_parent;
+ 	result = pgbackend->objects_read_sync(
+ 	  oi.soid, cursor.data_offset, max_read, osd_op.op.flags, &bl, chunk_parent_ptr);
+ 	if (result < 0)
+@@ -10716,14 +10713,9 @@ int PrimaryLogPG::do_cdc(const object_info_t& oi,
+    * Therefore, we should change the current implementation totally to make EC pool compatible. 
+    * As s result, we leave this as a future work.
+    */
+-  jspan_context dedup_parent;
+-  const jspan_context *dedup_parent_ptr = nullptr;
+-  if (ctx->op && ctx->op->osd_parent_span) {
+-    dedup_parent = ctx->op->osd_parent_span->GetContext();
+-    if (dedup_parent.IsValid()) dedup_parent_ptr = &dedup_parent;
+-  }
++  // dedup base-read context has no OpRequest in scope; orphan trace for now
+   int r = pgbackend->objects_read_sync(
+-      oi.soid, 0, oi.size, 0, &bl, dedup_parent_ptr);
++      oi.soid, 0, oi.size, 0, &bl, nullptr);
+   if (r < 0) {
+     dout(0) << __func__ << " read fail " << oi.soid
+             << " len: " << oi.size << " r: " << r << dendl;
+-- 
+2.53.0
+

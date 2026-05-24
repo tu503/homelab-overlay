@@ -255,6 +255,11 @@ PATCHES=(
 	# librados read overload with jspan_context*; threads RGW trace
 	# context through Objecter so GET traces link RGW -> OSD -> BlueStore
 	"${FILESDIR}/ceph-20.1.1-librados-read-trace.patch"
+	# Share single TracerProvider across osd+bluestore (otherwise the second
+	# SetTracerProvider in OpenTelemetry-cpp 1.24 shuts down the first's
+	# BatchSpanProcessor) + downstream build fixes (KStore::read signature,
+	# ECSwitch override, PrimaryLogPG jspan_context default-ctor + ctx vs op)
+	"${FILESDIR}/ceph-20.1.1-tracer-share-provider-build-fixes.patch"
 	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 
