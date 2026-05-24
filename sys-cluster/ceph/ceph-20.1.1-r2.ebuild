@@ -264,6 +264,10 @@ PATCHES=(
 	# (librados_asio.h async_operate, rgw_aio, rgw_rados, rgw_sal Params)
 	# so GET traces link rgw -> osd -> bluestore on replicated pools
 	"${FILESDIR}/ceph-20.1.1-rgw-get-trace-propagation.patch"
+	# Thread parent_trace through EC read pipeline + add otel_trace to
+	# MOSDECSubOpRead so peer-OSD shard reads link under the RGW GET
+	# (optimized ECBackend only; ECBackendL legacy stays orphan)
+	"${FILESDIR}/ceph-20.1.1-ec-trace-propagation.patch"
 	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 
