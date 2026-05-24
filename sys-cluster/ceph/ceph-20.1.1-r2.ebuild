@@ -245,10 +245,16 @@ PATCHES=(
 	# Initialize bluestore tracer + add read-path spans (otherwise the
 	# local-tracer patch above leaves queue_transactions/txc_aio_wait as no-ops)
 	"${FILESDIR}/ceph-20.1.1-bluestore-tracer-enable.patch"
+	# Split BlueStore::read into bluestore_read/get_onode/_do_read sub-spans
+	# and accept a parent jspan_context so GET traces fan all the way down
+	"${FILESDIR}/ceph-20.1.1-bluestore-read-subspans.patch"
 	"${FILESDIR}/ceph-20.1.1-tracer-null-guard.patch"
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-trace-propagation.patch"
 	# Drop upload_id from multipart parent span name (cardinality bound)
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-span-name-fix.patch"
+	# librados read overload with jspan_context*; threads RGW trace
+	# context through Objecter so GET traces link RGW -> OSD -> BlueStore
+	"${FILESDIR}/ceph-20.1.1-librados-read-trace.patch"
 	"${FILESDIR}/ceph-20.1.1-ec-backendl-otel-trace-propagation.patch"
 )
 

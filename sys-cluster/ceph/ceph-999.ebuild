@@ -221,9 +221,12 @@ PATCHES=(
 	"${FILESDIR}/ceph-19.2.1-isa-l.patch"
 	"${FILESDIR}/ceph-19.2.2-QATAPP-Fix-clang-16-compiling-issue.patch"
 	# OTLP patches not needed — already committed in the ceph-999 branch,
-	# except these fixes landed after the branch was last rebased
+	# except these four fixes landed after the branch was last rebased
+	# (will be committed to the branch and removed from here once verified)
 	"${FILESDIR}/ceph-20.1.1-rgw-multipart-span-name-fix.patch"
 	"${FILESDIR}/ceph-20.1.1-bluestore-tracer-enable.patch"
+	"${FILESDIR}/ceph-20.1.1-bluestore-read-subspans.patch"
+	"${FILESDIR}/ceph-20.1.1-librados-read-trace.patch"
 	"${FILESDIR}/ceph-19.2.2-common-add-dependency-on-legacy-option-headers.patch"
 	"${FILESDIR}/ceph-19.2.2-rbd-make-enums-statically-castable.patch"
 	"${FILESDIR}/ceph-19.2.2-rgw-remove-FMT_STRING-to-fix-clang-20-build-failure.patch"

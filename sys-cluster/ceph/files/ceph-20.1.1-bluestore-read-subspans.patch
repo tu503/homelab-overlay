@@ -1,0 +1,285 @@
+From: Chris Lu <lu@alcg.io>
+Date: Sat, 23 May 2026 19:30:00 -0400
+Subject: [PATCH] bluestore: split read into bluestore_read/get_onode/_do_read
+ sub-spans + accept parent trace
+
+Once ceph-20.1.1-librados-read-trace.patch lands, RGW GETs propagate
+OTel context to the OSD and op->osd_parent_span becomes a real
+recording span on the read path. This patch threads that context
+down through the read pipeline so BlueStore-level spans link under
+the OSD's read trace instead of being orphan roots.
+
+  * ObjectStore::read virtual gains an optional jspan_context*
+    parent_trace param (defaults to nullptr; existing callers
+    compile unchanged).
+  * BlueStore::read and MemStore::read overrides updated.
+  * BlueStore::read replaces the orphan start_trace from the
+    bluestore-tracer-enable patch with a parent-aware span and adds
+    two child spans:
+      - get_onode: time spent loading the Onode from the kv store
+      - _do_read: time spent in the actual extent read (BlueFS/bdev)
+  * PGBackend::objects_read_sync and ReplicatedBackend's override
+    take a parent jspan_ptr; pass its context to store->read.
+  * PrimaryLogPG.cc updated at the four objects_read_sync call sites
+    (CEPH_OSD_OP_READ, the chunk-read path, the dedup base read,
+    and the direct hit-set-archive read) plus the direct store->read
+    at the hit-set-archive site, to pass ctx->op->osd_parent_span's
+    context.
+
+After this, a GET trace fans out as:
+  rgw_request → rados_read → op-request-created → dequeue_op → do_op
+    → execute_ctx → bluestore_read → {get_onode, _do_read}
+
+bluestore::tracer spans surface as service.name="bluestore" in Tempo,
+and Prometheus span-metrics gain
+traces_spanmetrics_latency_bucket{service="bluestore",
+span_name="bluestore_read|get_onode|_do_read"} per OSD.
+
+Signed-off-by: Chris Lu <lu@alcg.io>
+---
+ src/os/ObjectStore.h                    |  4 +++-
+ src/os/bluestore/BlueStore.cc           | 33 +++++++++++++++++++++++--------
+ src/os/bluestore/BlueStore.h            |  3 ++-
+ src/os/memstore/MemStore.cc             |  3 ++-
+ src/os/memstore/MemStore.h              |  3 ++-
+ src/osd/PGBackend.h                     |  3 ++-
+ src/osd/PrimaryLogPG.cc                 | 28 ++++++++++++++++++++-----
+ src/osd/ReplicatedBackend.cc            |  5 +++--
+ src/osd/ReplicatedBackend.h             |  3 ++-
+ 9 files changed, 65 insertions(+), 20 deletions(-)
+
+diff --git a/src/os/ObjectStore.h b/src/os/ObjectStore.h
+--- a/src/os/ObjectStore.h
++++ b/src/os/ObjectStore.h
+@@ -22,6 +22,7 @@
+ #include "include/types.h"
+
+ #include "osd/osd_types.h"
++#include "common/tracer.h"
+ #include "common/TrackedOp.h"
+ #include "common/WorkQueue.h"
+ #include "os/Transaction.h"
+@@ -487,7 +488,8 @@ public:
+      const ghobject_t& oid,
+      uint64_t offset,
+      size_t len,
+      ceph::buffer::list& bl,
+-     uint32_t op_flags = 0) = 0;
++     uint32_t op_flags = 0,
++     const jspan_context *parent_trace = nullptr) = 0;
+
+   /**
+diff --git a/src/os/bluestore/BlueStore.h b/src/os/bluestore/BlueStore.h
+--- a/src/os/bluestore/BlueStore.h
++++ b/src/os/bluestore/BlueStore.h
+@@ -3236,7 +3236,8 @@ public:
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+-    uint32_t op_flags = 0) override;
++    uint32_t op_flags = 0,
++    const jspan_context *parent_trace = nullptr) override;
+
+ private:
+diff --git a/src/os/bluestore/BlueStore.cc b/src/os/bluestore/BlueStore.cc
+--- a/src/os/bluestore/BlueStore.cc
++++ b/src/os/bluestore/BlueStore.cc
+@@ -12449,15 +12449,18 @@ int BlueStore::read(
+   CollectionHandle &c_,
+   const ghobject_t& oid,
+   uint64_t offset,
+   size_t length,
+   bufferlist& bl,
+-  uint32_t op_flags)
++  uint32_t op_flags,
++  const jspan_context *parent_trace)
+ {
+-  auto read_span = tracing::bluestore::tracer.start_trace("bluestore_read");
++  auto read_span = (parent_trace && parent_trace->IsValid())
++    ? tracing::bluestore::tracer.add_span("bluestore_read", *parent_trace)
++    : tracing::bluestore::tracer.start_trace("bluestore_read");
+   if (read_span->IsRecording()) {
+     read_span->SetAttribute("offset", (int64_t)offset);
+     read_span->SetAttribute("length", (int64_t)length);
+     read_span->SetAttribute("op_flags", (int64_t)op_flags);
+   }
+   auto start = mono_clock::now();
+   Collection *c = static_cast<Collection *>(c_.get());
+   const coll_t &cid = c->get_cid();
+@@ -12471,8 +12474,12 @@ int BlueStore::read(
+   int r;
+   {
+     std::shared_lock l(c->lock);
+     auto start1 = mono_clock::now();
+-    OnodeRef o = c->get_onode(oid, false);
++    OnodeRef o;
++    {
++      auto onode_span = tracing::bluestore::tracer.add_span("get_onode", read_span);
++      o = c->get_onode(oid, false);
++    }
+     log_latency("get_onode@read",
+       l_bluestore_read_onode_meta_lat,
+       mono_clock::now() - start1,
+@@ -12484,8 +12491,18 @@ int BlueStore::read(
+     }
+
+     if (offset == length && offset == 0)
+       length = o->onode.size;
+
+-    r = _do_read(c, o, offset, length, bl, op_flags);
++    {
++      auto do_read_span = tracing::bluestore::tracer.add_span("_do_read", read_span);
++      if (do_read_span->IsRecording()) {
++        do_read_span->SetAttribute("onode_size", (int64_t)o->onode.size);
++        do_read_span->SetAttribute("offset", (int64_t)offset);
++        do_read_span->SetAttribute("length", (int64_t)length);
++      }
++      r = _do_read(c, o, offset, length, bl, op_flags);
++      if (do_read_span->IsRecording()) {
++        do_read_span->SetAttribute("retval", r);
++      }
++    }
+     if (r == -EIO) {
+       logger->inc(l_bluestore_read_eio);
+     }
+diff --git a/src/os/memstore/MemStore.h b/src/os/memstore/MemStore.h
+--- a/src/os/memstore/MemStore.h
++++ b/src/os/memstore/MemStore.h
+@@ -297,7 +297,8 @@ public:
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+-    uint32_t op_flags = 0) override;
++    uint32_t op_flags = 0,
++    const jspan_context *parent_trace = nullptr) override;
+
+ private:
+diff --git a/src/os/memstore/MemStore.cc b/src/os/memstore/MemStore.cc
+--- a/src/os/memstore/MemStore.cc
++++ b/src/os/memstore/MemStore.cc
+@@ -358,7 +358,8 @@ int MemStore::read(
+   const ghobject_t& oid,
+   uint64_t offset,
+   size_t len,
+   ceph::buffer::list& bl,
+-  uint32_t op_flags)
++  uint32_t op_flags,
++  const jspan_context *parent_trace)
+ {
+   Collection *c = static_cast<Collection*>(c_.get());
+   dout(10) << __func__ << " " << c->get_cid() << " " << oid << " "
+diff --git a/src/osd/PGBackend.h b/src/osd/PGBackend.h
+--- a/src/osd/PGBackend.h
++++ b/src/osd/PGBackend.h
+@@ -591,7 +591,8 @@ class PGBackend {
+      const hobject_t &hoid,
+      uint64_t off,
+      uint64_t len,
+      uint32_t op_flags,
+-     ceph::buffer::list *bl) = 0;
++     ceph::buffer::list *bl,
++     const jspan_context *parent_trace = nullptr) = 0;
+
+    virtual int objects_readv_sync(
+      const hobject_t &hoid,
+diff --git a/src/osd/ReplicatedBackend.h b/src/osd/ReplicatedBackend.h
+--- a/src/osd/ReplicatedBackend.h
++++ b/src/osd/ReplicatedBackend.h
+@@ -137,7 +137,8 @@ public:
+     const hobject_t &hoid,
+     uint64_t off,
+     uint64_t len,
+     uint32_t op_flags,
+-    ceph::buffer::list *bl) override;
++    ceph::buffer::list *bl,
++    const jspan_context *parent_trace = nullptr) override;
+
+   int objects_readv_sync(
+     const hobject_t &hoid,
+diff --git a/src/osd/ReplicatedBackend.cc b/src/osd/ReplicatedBackend.cc
+--- a/src/osd/ReplicatedBackend.cc
++++ b/src/osd/ReplicatedBackend.cc
+@@ -278,9 +278,10 @@ int ReplicatedBackend::objects_read_sync(
+   const hobject_t &hoid,
+   uint64_t off,
+   uint64_t len,
+   uint32_t op_flags,
+-  bufferlist *bl)
++  bufferlist *bl,
++  const jspan_context *parent_trace)
+ {
+-  return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
++  return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags, parent_trace);
+ }
+
+ int ReplicatedBackend::objects_readv_sync(
+diff --git a/src/osd/PrimaryLogPG.cc b/src/osd/PrimaryLogPG.cc
+--- a/src/osd/PrimaryLogPG.cc
++++ b/src/osd/PrimaryLogPG.cc
+@@ -1610,7 +1610,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
+ 	  if (is_unreadable_object(oid)) {
+ 	    wait_for_unreadable_object(oid, op);
+ 	    return;
+ 	  }
+-	  result = osd->store->read(ch, ghobject_t(oid), 0, 0, osd_op.outdata);
++	  jspan_context hsa_parent;
++	  const jspan_context *hsa_parent_ptr = nullptr;
++	  if (ctx->op && ctx->op->osd_parent_span) {
++	    hsa_parent = ctx->op->osd_parent_span->GetContext();
++	    if (hsa_parent.IsValid()) hsa_parent_ptr = &hsa_parent;
++	  }
++	  result = osd->store->read(ch, ghobject_t(oid), 0, 0, osd_op.outdata, 0, hsa_parent_ptr);
+ 	}
+       }
+       break;
+@@ -5905,8 +5909,13 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
+       new ReadFinisher(osd_op));
+   } else {
++    jspan_context read_parent;
++    const jspan_context *read_parent_ptr = nullptr;
++    if (ctx->op && ctx->op->osd_parent_span) {
++      read_parent = ctx->op->osd_parent_span->GetContext();
++      if (read_parent.IsValid()) read_parent_ptr = &read_parent;
++    }
+     int r = pgbackend->objects_read_sync(
+-      soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
++      soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata, read_parent_ptr);
+     // whole object?  can we verify the checksum?
+     if (r >= 0 && op.extent.offset == 0 &&
+         (uint64_t)r == oi.size && oi.is_data_digest()) {
+@@ -9388,7 +9397,13 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
+ 	dout(10) << __func__ << ": async_read noted for " << soid << dendl;
+       } else {
+-	result = pgbackend->objects_read_sync(
+-	  oi.soid, cursor.data_offset, max_read, osd_op.op.flags, &bl);
++	jspan_context chunk_parent;
++	const jspan_context *chunk_parent_ptr = nullptr;
++	if (ctx->op && ctx->op->osd_parent_span) {
++	  chunk_parent = ctx->op->osd_parent_span->GetContext();
++	  if (chunk_parent.IsValid()) chunk_parent_ptr = &chunk_parent;
++	}
++	result = pgbackend->objects_read_sync(
++	  oi.soid, cursor.data_offset, max_read, osd_op.op.flags, &bl, chunk_parent_ptr);
+ 	if (result < 0)
+ 	  return result;
+       }
+@@ -10699,8 +10714,13 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
+    * Therefore, we should change the current implementation totally to make EC pool compatible.
+    * As s result, we leave this as a future work.
+    */
++  jspan_context dedup_parent;
++  const jspan_context *dedup_parent_ptr = nullptr;
++  if (ctx->op && ctx->op->osd_parent_span) {
++    dedup_parent = ctx->op->osd_parent_span->GetContext();
++    if (dedup_parent.IsValid()) dedup_parent_ptr = &dedup_parent;
++  }
+   int r = pgbackend->objects_read_sync(
+-      oi.soid, 0, oi.size, 0, &bl);
++      oi.soid, 0, oi.size, 0, &bl, dedup_parent_ptr);
+   if (r < 0) {
+     dout(0) << __func__ << " failed in objects_read_sync ret " << r << dendl;
+     return r;
+--
+2.52.0
