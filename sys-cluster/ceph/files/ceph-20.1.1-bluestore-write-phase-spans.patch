@@ -1,0 +1,186 @@
+From b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 17:05:00 -0400
+Subject: [PATCH] bluestore: instrument write-phase spans under queue_transactions
+
+After the bluestore-tracer-enable / bluestore-read-subspans series,
+the write path emitted only two bluestore spans per txc:
+queue_transactions and txc_aio_wait. Everything between - the per-extent
+data layout (_do_write_small / _do_write_big), the rocksdb submit
+inside _txc_apply_kv, and the post-commit finalize in _txc_committed_kv -
+was invisible. PUT tail latency could not be attributed to a phase.
+
+Add four child spans under txc->otel_span (= queue_transactions):
+
+  * _do_write_data: wraps the head/middle/tail dispatch in
+    _do_write_data with offset+length attributes.
+  * _do_write_small / _do_write_big: one per head/middle/tail/segment
+    extent slice; small spans tagged with part=head|tail; big spans
+    tagged with segmented=true when emitted from the segment loop.
+    Per-span offset+length recorded.
+  * kv_submit_transaction (in _txc_apply_kv): wraps rocksdb's
+    submit_transaction call, tagged with sync=true|false.
+  * kv_committed_finalize (in _txc_committed_kv): fires when
+    _kv_finalize_thread runs the post-commit fan-out for this txc.
+
+After this, a PUT trace fans out:
+  rgw put_obj -> ... -> queue_transactions
+    -> _do_write_data -> {_do_write_small|_do_write_big}+
+    -> txc_aio_wait                 [existing]
+    -> kv_submit_transaction
+    -> kv_committed_finalize
+
+Spans cost one add_span call per phase; the IsRecording guards keep
+the overhead at near-zero when tracing is disabled.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/os/bluestore/BlueStore.cc | 120 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 119 insertions(+), 1 deletion(-)
+
+--- a/src/os/bluestore/BlueStore.cc	2026-05-24 17:04:52.680270884 -0400
++++ b/src/os/bluestore/BlueStore.cc	2026-05-24 17:07:51.808887126 -0400
+@@ -14562,6 +14562,17 @@
+ void BlueStore::_txc_apply_kv(TransContext *txc, bool sync_submit_transaction)
+ {
+   ceph_assert(txc->get_state() == TransContext::STATE_KV_QUEUED);
++  // Phase span: rocksdb submit (sync or async). Parent is the txc's
++  // queue_transactions span. Fires from _kv_sync_thread for async, or
++  // inline for sync_submit_transaction.
++  jspan_ptr kv_submit_span;
++  if (txc->otel_span && txc->otel_span->IsRecording()) {
++    kv_submit_span = tracing::bluestore::tracer.add_span(
++        "kv_submit_transaction", txc->otel_span);
++    if (kv_submit_span->IsRecording()) {
++      kv_submit_span->SetAttribute("sync", sync_submit_transaction);
++    }
++  }
+   {
+ #if defined(WITH_LTTNG)
+     auto start = mono_clock::now();
+@@ -14609,6 +14620,13 @@
+ void BlueStore::_txc_committed_kv(TransContext *txc)
+ {
+   dout(20) << __func__ << " txc " << txc << dendl;
++  // Phase span: kv-finalize: post-commit fan-out. Parent is queue_transactions.
++  // This fires from _kv_finalize_thread once rocksdb has acknowledged.
++  jspan_ptr final_span;
++  if (txc->otel_span && txc->otel_span->IsRecording()) {
++    final_span = tracing::bluestore::tracer.add_span(
++        "kv_committed_finalize", txc->otel_span);
++  }
+   throttle.complete_kv(*txc);
+   {
+     std::lock_guard l(txc->osr->qlock);
+@@ -17315,13 +17333,36 @@
+   bufferlist& bl,
+   WriteContext *wctx)
+ {
++  // Phase span: per-extent dispatch of the write payload into small/big
++  // writes. Parent is the txc's queue_transactions span set in
++  // queue_transactions(); when that's null (deferred replays, no client
++  // op) the span is a no-op.
++  jspan_ptr data_span;
++  if (txc->otel_span && txc->otel_span->IsRecording()) {
++    data_span = tracing::bluestore::tracer.add_span("_do_write_data",
++                                                    txc->otel_span);
++    if (data_span->IsRecording()) {
++      data_span->SetAttribute("offset", (int64_t)offset);
++      data_span->SetAttribute("length", (int64_t)length);
++    }
++  }
+   uint64_t end = offset + length;
+   bufferlist::iterator p = bl.begin();
+ 
+   if (offset / min_alloc_size == (end - 1) / min_alloc_size &&
+       (length != min_alloc_size)) {
+     // we fall within the same block
+-    _do_write_small(txc, c, o, offset, length, p, wctx);
++    if (data_span) {
++      auto small_span = tracing::bluestore::tracer.add_span("_do_write_small",
++                                                            data_span);
++      if (small_span->IsRecording()) {
++        small_span->SetAttribute("offset", (int64_t)offset);
++        small_span->SetAttribute("length", (int64_t)length);
++      }
++      _do_write_small(txc, c, o, offset, length, p, wctx);
++    } else {
++      _do_write_small(txc, c, o, offset, length, p, wctx);
++    }
+   } else {
+     uint64_t head_offset, head_length;
+     uint64_t middle_offset, middle_length;
+@@ -17337,7 +17378,18 @@
+     middle_length = length - head_length - tail_length;
+ 
+     if (head_length) {
+-      _do_write_small(txc, c, o, head_offset, head_length, p, wctx);
++      if (data_span) {
++        auto head_span = tracing::bluestore::tracer.add_span("_do_write_small",
++                                                             data_span);
++        if (head_span->IsRecording()) {
++          head_span->SetAttribute("part", "head");
++          head_span->SetAttribute("offset", (int64_t)head_offset);
++          head_span->SetAttribute("length", (int64_t)head_length);
++        }
++        _do_write_small(txc, c, o, head_offset, head_length, p, wctx);
++      } else {
++        _do_write_small(txc, c, o, head_offset, head_length, p, wctx);
++      }
+     }
+     uint32_t segment_size = o->onode.segment_size;
+     if (segment_size) {
+@@ -17347,15 +17399,47 @@
+ 	uint64_t segment_end = std::min(
+ 	  p2roundup<uint64_t>(write_offset + 1, segment_size),
+ 	  middle_offset + middle_length);
+-	_do_write_big(txc, c, o, write_offset, segment_end - write_offset, p, wctx);
++        if (data_span) {
++          auto big_span = tracing::bluestore::tracer.add_span("_do_write_big",
++                                                              data_span);
++          if (big_span->IsRecording()) {
++            big_span->SetAttribute("offset", (int64_t)write_offset);
++            big_span->SetAttribute("length", (int64_t)(segment_end - write_offset));
++            big_span->SetAttribute("segmented", true);
++          }
++          _do_write_big(txc, c, o, write_offset, segment_end - write_offset, p, wctx);
++        } else {
++          _do_write_big(txc, c, o, write_offset, segment_end - write_offset, p, wctx);
++        }
+ 	write_offset = segment_end;
+       }
+     } else {
+-      _do_write_big(txc, c, o, middle_offset, middle_length, p, wctx);
++      if (data_span) {
++        auto big_span = tracing::bluestore::tracer.add_span("_do_write_big",
++                                                            data_span);
++        if (big_span->IsRecording()) {
++          big_span->SetAttribute("offset", (int64_t)middle_offset);
++          big_span->SetAttribute("length", (int64_t)middle_length);
++        }
++        _do_write_big(txc, c, o, middle_offset, middle_length, p, wctx);
++      } else {
++        _do_write_big(txc, c, o, middle_offset, middle_length, p, wctx);
++      }
+     }
+ 
+     if (tail_length) {
+-      _do_write_small(txc, c, o, tail_offset, tail_length, p, wctx);
++      if (data_span) {
++        auto tail_span = tracing::bluestore::tracer.add_span("_do_write_small",
++                                                             data_span);
++        if (tail_span->IsRecording()) {
++          tail_span->SetAttribute("part", "tail");
++          tail_span->SetAttribute("offset", (int64_t)tail_offset);
++          tail_span->SetAttribute("length", (int64_t)tail_length);
++        }
++        _do_write_small(txc, c, o, tail_offset, tail_length, p, wctx);
++      } else {
++        _do_write_small(txc, c, o, tail_offset, tail_length, p, wctx);
++      }
+     }
+   }
+ }
+-- 
+2.53.0
+

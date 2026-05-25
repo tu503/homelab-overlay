@@ -1,0 +1,207 @@
+From f6071829304a5b6c7d8e9f0a1b2c3d4e5f607182 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 21:35:00 -0400
+Subject: [PATCH] rgw: thread trace_ctx through ReadOp::iterate so rados_read
+ links into the rgw GET trace
+
+End-to-end plumbing so the rados_read span (added by
+ceph-20.1.1-rgw-aio-rados-read-span.patch) attaches under the rgw
+get_obj_data span instead of starting an orphan trace.
+
+  1. rgw_sal.h: const jspan_context* trace_ctx field in ReadOp::Params.
+  2. rgw_aio.h/.cc: librados_op<ObjectReadOperation> gains the
+     trace_ctx parameter (mirror of the existing write overload).
+  3. rgw_rados.h: trace_ctx field on get_obj_data struct +
+     RGWRados::Object::Read::iterate gains a trace_ctx parameter.
+  4. rgw_rados.cc: Read::iterate forwards into get_obj_data;
+     _get_obj_iterate_cb passes d->trace_ctx to librados_op so the
+     OSD MOSDOp arrives with a parent context.
+  5. rgw_sal_rados.cc: RadosReadOp::iterate forwards
+     params.trace_ctx to parent_op.iterate.
+  6. rgw_op.cc: three iterate() call sites
+     (read_user_manifest_part / main S3 GET / decrypt-inline) set
+     params.trace_ctx to the get_obj_data span (or s->trace) before
+     iterate, reset after.
+
+After: S3 GET fans out
+  get_obj -> execute -> get_obj_data
+    -> rados_read (per 4MiB chunk)
+      -> op-request-created -> ... -> bluestore_read -> {_do_read, get_onode}
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/rgw/driver/rados/rgw_rados.cc     |  4 ++--
+ src/rgw/driver/rados/rgw_rados.h      | 13 +++++++++++--
+ src/rgw/driver/rados/rgw_sal_rados.cc |  6 +++++-
+ src/rgw/rgw_aio.cc                    |  4 ++--
+ src/rgw/rgw_aio.h                     |  2 +-
+ src/rgw/rgw_op.cc                     | 32 ++++++++++++++++++++++++++--
+ src/rgw/rgw_sal.h                     |  5 +++++
+ 7 files changed, 56 insertions(+), 10 deletions(-)
+
+--- a/src/rgw/rgw_sal.h
++++ b/src/rgw/rgw_sal.h
+@@ -1120,6 +1120,11 @@ class Object {
+         /// If the object is multipart, the total number of multipart
+         /// parts is assigned to this output parameter.
+         std::optional<int> parts_count;
++        /// Optional parent OTel trace context. When set, iterate() threads
++        /// it through librados so OSD/bluestore read spans link under the
++        /// rgw GET trace (see ceph-20.1.1-rgw-aio-rados-read-span.patch and
++        /// ceph-20.1.1-librados-read-trace.patch).
++        const jspan_context* trace_ctx{nullptr};
+       } params;
+ 
+       virtual ~ReadOp() = default;
+--- a/src/rgw/rgw_aio.h
++++ b/src/rgw/rgw_aio.h
+@@ -97,7 +97,7 @@ class Aio {
+ 
+   static OpFunc librados_op(librados::IoCtx ctx,
+                             librados::ObjectReadOperation&& op,
+-                            optional_yield y);
++                            optional_yield y, jspan_context *trace_ctx = nullptr);
+   static OpFunc librados_op(librados::IoCtx ctx,
+                             librados::ObjectWriteOperation&& op,
+                             optional_yield y, jspan_context *trace_ctx = nullptr);
+--- a/src/rgw/rgw_aio.cc
++++ b/src/rgw/rgw_aio.cc
+@@ -174,8 +174,8 @@ Aio::OpFunc aio_abstract(librados::IoCtx ctx, Op&& op, optional_yield y, jspan_c
+ 
+ Aio::OpFunc Aio::librados_op(librados::IoCtx ctx,
+                              librados::ObjectReadOperation&& op,
+-                             optional_yield y) {
+-  return aio_abstract(std::move(ctx), std::move(op), y);
++                             optional_yield y, jspan_context *trace_ctx) {
++  return aio_abstract(std::move(ctx), std::move(op), y, trace_ctx);
+ }
+ Aio::OpFunc Aio::librados_op(librados::IoCtx ctx,
+                              librados::ObjectWriteOperation&& op,
+--- a/src/rgw/driver/rados/rgw_rados.h
++++ b/src/rgw/driver/rados/rgw_rados.h
+@@ -810,7 +810,8 @@ public:
+         delete state.cur_ioctx;
+       }
+ 
+-      int iterate(const DoutPrefixProvider *dpp, int64_t ofs, int64_t end, RGWGetDataCB *cb, optional_yield y);
++      int iterate(const DoutPrefixProvider *dpp, int64_t ofs, int64_t end, RGWGetDataCB *cb, optional_yield y,
++                  jspan_context *trace_ctx = nullptr);
+ 
+       int get_attr(const DoutPrefixProvider *dpp, const char *name, bufferlist& dest, optional_yield y);
+     };
+@@ -1757,10 +1758,18 @@ struct get_obj_data {
+   uint64_t offset; // next offset to write to client
+   rgw::AioResultList completed; // completed read results, sorted by offset
+   optional_yield yield;
++  // Optional OTel parent context threaded from rgw_op.cc ReadOp::params.trace_ctx
++  // -> RGWRados::Object::Read::iterate -> here -> _get_obj_iterate_cb ->
++  // rgw::Aio::librados_op(...trace_ctx) -> rados_read span parent.
++  jspan_context* trace_ctx{nullptr};
+ 
+   get_obj_data(RGWRados* rgwrados, RGWGetDataCB* cb, rgw::Aio* aio,
+-               uint64_t offset, optional_yield yield)
+-               : rgwrados(rgwrados), client_cb(cb), aio(aio), offset(offset), yield(yield) {}
++               uint64_t offset, optional_yield yield,
++               jspan_context* trace_ctx = nullptr)
++               : rgwrados(rgwrados), client_cb(cb), aio(aio), offset(offset),
++                 yield(yield), trace_ctx(trace_ctx) {}
+   ~get_obj_data() {
+     if (rgwrados->get_use_datacache()) {
+       const std::lock_guard l(d3n_get_data.d3n_lock);
+--- a/src/rgw/driver/rados/rgw_rados.cc
++++ b/src/rgw/driver/rados/rgw_rados.cc
+@@ -8063,20 +8063,20 @@ int RGWRados::get_obj_iterate_cb(const DoutPrefixProvider *dpp,
+   const uint64_t cost = len;
+   const uint64_t id = obj_ofs; // use logical object offset for sorting replies
+ 
+-  auto completed = d->aio->get(obj.obj, rgw::Aio::librados_op(obj.ioctx, std::move(op), d->yield), cost, id);
++  auto completed = d->aio->get(obj.obj, rgw::Aio::librados_op(obj.ioctx, std::move(op), d->yield, d->trace_ctx), cost, id);
+ 
+   return d->flush(std::move(completed));
+ }
+ 
+ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, int64_t end, RGWGetDataCB *cb,
+-                                    optional_yield y)
++                                    optional_yield y, jspan_context *trace_ctx)
+ {
+   RGWRados *store = source->get_store();
+   CephContext *cct = store->ctx();
+   const uint64_t chunk_size = cct->_conf->rgw_get_obj_max_req_size;
+   const uint64_t window_size = cct->_conf->rgw_get_obj_window_size;
+ 
+   auto aio = rgw::make_throttle(window_size, y);
+-  get_obj_data data(store, cb, &*aio, ofs, y);
++  get_obj_data data(store, cb, &*aio, ofs, y, trace_ctx);
+ 
+   if (state.obj.empty()) {
+     state.obj = source->get_obj();
+--- a/src/rgw/driver/rados/rgw_sal_rados.cc
++++ b/src/rgw/driver/rados/rgw_sal_rados.cc
+@@ -3675,7 +3675,11 @@ int RadosObject::RadosReadOp::read(int64_t ofs, int64_t end, bufferlist& bl, opt
+ 
+ int RadosObject::RadosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
+ {
+-  return parent_op.iterate(dpp, ofs, end, cb, y);
++  // Thread the caller-supplied OTel parent context through to the rados
++  // Read::iterate, which forwards it via get_obj_data into the rgw aio
++  // path. Without this the chunk reads start orphan rados_read traces.
++  return parent_op.iterate(dpp, ofs, end, cb, y,
++                           const_cast<jspan_context*>(params.trace_ctx));
+ }
+ 
+ int RadosObject::swift_versioning_restore(const ACLOwner& owner, const rgw_user& remote_user, bool& restored,
+--- a/src/rgw/rgw_op.cc
++++ b/src/rgw/rgw_op.cc
+@@ -1934,7 +1934,15 @@ int RGWGetObj::read_user_manifest_part(rgw::sal::Bucket* bucket,
+   auto counters = rgw::op_counters::get(s);
+   rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, cur_end - cur_ofs);
+   filter->fixup_range(cur_ofs, cur_end);
++  // Plumb req-level trace context so rados_read spans link under this trace
++  jspan_context manifest_part_ctx{false, false};
++  if (s->trace && s->trace->IsRecording()) {
++    manifest_part_ctx = s->trace->GetContext();
++    if (manifest_part_ctx.IsValid())
++      read_op->params.trace_ctx = &manifest_part_ctx;
++  }
+   op_ret = read_op->iterate(this, cur_ofs, cur_end, filter, s->yield);
++  read_op->params.trace_ctx = nullptr;
+   if (op_ret >= 0)
+ 	  op_ret = filter->flush();
+   return op_ret;
+@@ -2668,7 +2676,17 @@ void RGWGetObj::execute(optional_yield y)
+       data_span->SetAttribute("end", end_x);
+       data_span->SetAttribute("size", end_x - ofs_x + 1);
+     }
++    // Plumb the get_obj_data span context into the rados read path so each
++    // librados chunk read (rados_read span) attaches under this span instead
++    // of starting a new orphan trace.
++    jspan_context data_ctx{false, false};
++    if (data_span->IsRecording()) {
++      data_ctx = data_span->GetContext();
++      if (data_ctx.IsValid())
++        read_op->params.trace_ctx = &data_ctx;
++    }
+     op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
++    read_op->params.trace_ctx = nullptr;
+ 
+     if (op_ret >= 0)
+       op_ret = filter->flush();
+@@ -4283,7 +4301,17 @@ int RGWGetObj_Filter_SSEC::create_data(int64_t ofs, int64_t end,
+     return ret;
+ 
+   filter->fixup_range(new_ofs, new_end);
++  // Plumb req-level trace context (this path is the decrypt/inline read,
++  // doesn't have its own data span).
++  jspan_context decrypt_ctx{false, false};
++  if (s->trace && s->trace->IsRecording()) {
++    decrypt_ctx = s->trace->GetContext();
++    if (decrypt_ctx.IsValid())
++      read_op->params.trace_ctx = &decrypt_ctx;
++  }
+   ret = read_op->iterate(this, new_ofs, new_end, filter, s->yield);
++  read_op->params.trace_ctx = nullptr;
+ 
+   if (ret >= 0)
+     ret = filter->flush();
+-- 
+2.53.0

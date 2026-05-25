@@ -1,0 +1,87 @@
+From d4e5f6071829304a5b6c7d8e9f0a1b2c3d4e5f60 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 19:50:00 -0400
+Subject: [PATCH] tracer: add init_from_global + bind bluestore to global
+
+bluestore-tracer-enable.patch added
+  tracing::bluestore::tracer.init(cct, "bluestore", ...)
+in OSD::init(), called right after the osd tracer's own init().
+
+Both calls go through Tracer::init() which ends with
+  opentelemetry::trace::Provider::SetTracerProvider(provider);
+This REPLACES the global TracerProvider. With opentelemetry-cpp 1.24,
+replacing the global drops the OSD's previous provider, which shuts
+down the osd-named BatchSpanProcessor + OtlpHttpExporter. The osd
+Tracer object still works but its spans never get exported - OSD
+spans silently disappear from Tempo.
+
+  1. Add Tracer::init_from_global declaration + definition. Binds a
+     Tracer scope to the already-installed global TracerProvider
+     instead of creating a new one.
+  2. Switch the bluestore init in OSD::init() to call init_from_global,
+     binding a "bluestore" scope to the osd provider.
+
+Trade-off: bluestore spans surface under service.name=osd instead of
+service.name=bluestore. That matches the historical behavior of this
+overlay (pre-r3 builds) and keeps the OSD span chain working.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/common/tracer.cc | 10 ++++++++++
+ src/common/tracer.h  |  6 ++++++
+ src/osd/OSD.cc       |  9 ++++++++-
+ 3 files changed, 24 insertions(+), 1 deletion(-)
+
+--- a/src/common/tracer.h
++++ b/src/common/tracer.h
+@@ -37,6 +37,12 @@ public:
+   void init(CephContext* _cct, opentelemetry::nostd::string_view service_name,
+             opentelemetry::nostd::string_view instance_id = "",
+             const std::map<std::string, std::string>& extra_attrs = {});
++
++  // Bind a Tracer scope to the existing global TracerProvider instead of
++  // creating a new one. Use this when another Tracer in the same process has
++  // already called init() - calling init() a second time replaces the global
++  // and orphans the first provider's processor/exporter.
++  void init_from_global(CephContext* _cct, opentelemetry::nostd::string_view scope_name);
+ 
+   bool is_enabled() const;
+   // creates and returns a new span with `trace_name`
+--- a/src/common/tracer.cc
++++ b/src/common/tracer.cc
+@@ -58,6 +58,16 @@ void Tracer::init(CephContext* _cct, opentelemetry::nostd::string_view service_n
+   }
+ }
+ 
++void Tracer::init_from_global(CephContext* _cct, opentelemetry::nostd::string_view scope_name) {
++  ceph_assert(_cct);
++  cct = _cct;
++  if (!tracer) {
++    ldout(cct, 3) << "binding tracer scope '" << scope_name << "' to global provider" << dendl;
++    auto provider = opentelemetry::trace::Provider::GetTracerProvider();
++    tracer = provider->GetTracer(scope_name, OPENTELEMETRY_SDK_VERSION);
++  }
++}
++
+ jspan_ptr Tracer::start_trace(opentelemetry::nostd::string_view trace_name) {
+   ceph_assert(cct);
+   if (is_enabled()) {
+--- a/src/osd/OSD.cc
++++ b/src/osd/OSD.cc
+@@ -3746,7 +3746,14 @@ int OSD::init()
+   if (is_stopping())
+     return 0;
+   tracing::osd::tracer.init(cct, "osd", std::to_string(whoami));
+-  tracing::bluestore::tracer.init(cct, "bluestore", std::to_string(whoami));
++  // Bind bluestore tracer to the SAME global provider rather than creating a
++  // new one - Tracer::init's Provider::SetTracerProvider call replaces the
++  // global, which orphans the osd Provider's processor/exporter and silently
++  // drops all OSD spans. With init_from_global, bluestore spans surface under
++  // the same service.name=osd resource, but every span (osd + bluestore) is
++  // actually exported.
++  tracing::bluestore::tracer.init_from_global(cct, "bluestore");
+   tick_timer.init();
+   tick_timer_without_osd_lock.init();
+   service.recovery_request_timer.init();
+-- 
+2.53.0

@@ -1,0 +1,49 @@
+From e5f6071829304a5b6c7d8e9f0a1b2c3d4e5f6071 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 19:55:00 -0400
+Subject: [PATCH] rgw_aio: emit rados_read span even when no parent trace_ctx
+
+The rgw aio chunk-read path is called with trace_ctx = the rgw request's
+jspan_context, but in many real RGW execution paths that pointer is
+either null or carries an invalid context (no upstream sampling
+decision). add_span(name, invalid_ctx) returns a noop_span, so my new
+rados_read instrumentation was invisible.
+
+Mirror the bluestore_read pattern: use start_trace when no valid
+parent is available, add_span when there is one. The orphan
+rados_read span still produces useful per-chunk timing in Tempo and is
+the standard fallback used elsewhere in the codebase.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/rgw/rgw_aio.cc | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+--- a/src/rgw/rgw_aio.cc
++++ b/src/rgw/rgw_aio.cc
+@@ -63,8 +63,8 @@ Aio::OpFunc aio_abstract(librados::IoCtx ctx, Op&& op, jspan_context* trace_ctx
+       jspan_context child_ctx{false, false};
+       jspan_context *effective_trace_ctx = trace_ctx;
+       if constexpr (read) {
+-        rados_span = tracing::rgw::tracer.add_span("rados_read",
+-            trace_ctx ? *trace_ctx : jspan_context{false, false});
++        rados_span = (trace_ctx && trace_ctx->IsValid())
++            ? tracing::rgw::tracer.add_span("rados_read", *trace_ctx)
++            : tracing::rgw::tracer.start_trace("rados_read");
+         if (rados_span && rados_span->IsRecording()) {
+           rados_span->SetAttribute("oid", r.obj.oid);
+           rados_span->SetAttribute("pool", ctx.get_pool_name());
+@@ -125,8 +125,8 @@ Aio::OpFunc aio_abstract(librados::IoCtx ctx, Op&& op,
+       jspan_context child_ctx{false, false};
+       jspan_context *effective_trace_ctx = trace_ctx;
+       if constexpr (read) {
+-        rados_span = tracing::rgw::tracer.add_span("rados_read",
+-            trace_ctx ? *trace_ctx : jspan_context{false, false});
++        rados_span = (trace_ctx && trace_ctx->IsValid())
++            ? tracing::rgw::tracer.add_span("rados_read", *trace_ctx)
++            : tracing::rgw::tracer.start_trace("rados_read");
+         if (rados_span && rados_span->IsRecording()) {
+           rados_span->SetAttribute("oid", r.obj.oid);
+           rados_span->SetAttribute("pool", ctx.get_pool_name());
+-- 
+2.53.0

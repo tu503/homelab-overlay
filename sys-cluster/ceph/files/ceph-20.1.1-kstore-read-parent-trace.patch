@@ -1,0 +1,51 @@
+From c2d3e4f50617283940a5b6c7d8e9f0a1b2c3d4e5 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 17:30:00 -0400
+Subject: [PATCH] kstore: add parent_trace param to KStore::read override
+
+The bluestore-read-subspans patch added an optional
+`const jspan_context *parent_trace = nullptr` to the
+ObjectStore::read virtual + the MemStore and BlueStore overrides,
+but missed the KStore override. With gcc 15 the resulting
+signature mismatch is a hard error ("marked 'override', but does
+not override"), making KStore abstract and breaking the ObjectStore
+factory in src/os/ObjectStore.cc.
+
+Update KStore.h declaration and KStore.cc definition to take the
+new optional param. KStore itself does not need to do anything
+with the parent_trace (no built-in tracer like BlueStore); the
+param is accepted and ignored.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/os/kstore/KStore.cc | 3 ++-
+ src/os/kstore/KStore.h  | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+--- a/src/os/kstore/KStore.h	2026-05-24 17:29:59.165816130 -0400
++++ b/src/os/kstore/KStore.h	2026-05-24 17:29:59.155816580 -0400
+@@ -457,7 +457,8 @@
+     uint64_t offset,
+     size_t len,
+     ceph::buffer::list& bl,
+-    uint32_t op_flags = 0) override;
++    uint32_t op_flags = 0,
++    const jspan_context *parent_trace = nullptr) override;
+   int _do_read(
+     OnodeRef o,
+     uint64_t offset,
+--- a/src/os/kstore/KStore.cc	2026-05-24 17:29:59.172482495 -0400
++++ b/src/os/kstore/KStore.cc	2026-05-24 17:29:59.159149763 -0400
+@@ -1180,7 +1180,8 @@
+   uint64_t offset,
+   size_t length,
+   bufferlist& bl,
+-  uint32_t op_flags)
++  uint32_t op_flags,
++  const jspan_context *parent_trace)
+ {
+   dout(15) << __func__ << " " << ch->cid << " " << oid
+ 	   << " " << offset << "~" << length
+-- 
+2.53.0
+

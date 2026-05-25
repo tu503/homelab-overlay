@@ -1,0 +1,123 @@
+From a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 Mon Sep 17 00:00:00 2001
+From: Chris Lu <lu@alcg.io>
+Date: Sun, 24 May 2026 17:00:00 -0400
+Subject: [PATCH] rgw_aio: add rados_read span around each chunk read
+
+The previous librados-read-trace patch added a `rados_read` span only
+in rgw_rados_operate (the sync read overload in rgw_tools.cc). The
+S3 GET data path does not go through that function - it uses
+rgw::Aio::librados_op(... ObjectReadOperation ..., y, trace_ctx) via
+RGWRados::Object::Read::iterate / _get_obj_iterate_cb, which routes
+to aio_abstract in rgw_aio.cc.
+
+Real S3 GETs were issuing librados read RPCs through the immediate
+aio_abstract that even dropped the trace_ctx entirely (`(void)trace_ctx`),
+so MOSDOp arrived at the OSD with no parent and OSD-side spans
+started a new trace. The yield-context aio_abstract did forward
+trace_ctx but never wrapped a rgw-side rados_read span around the
+call. As a result there was nothing between rgw `get_obj_data` and
+OSD `op-request-created` in GET traces.
+
+Add a rados_read span inside both aio_abstract overloads (immediate
+and yield variants) for the ObjectReadOperation case. The span is a
+child of trace_ctx (the rgw_op trace), records oid + pool, and is
+threaded into the librados aio call so the OSD attaches under it.
+The immediate variant additionally switches to the new
+IoCtx::aio_operate ObjectReadOperation+jspan_context overload added
+by ceph-20.1.1-librados-read-trace.patch (it was previously using
+the old 4-arg form). Each chunk read (default 4 MiB) gets one span.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ src/rgw/rgw_aio.cc | 56 +++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 54 insertions(+), 2 deletions(-)
+
+--- a/src/rgw/rgw_aio.cc	2026-05-24 17:04:52.680270884 -0400
++++ b/src/rgw/rgw_aio.cc	2026-05-24 17:05:22.338937960 -0400
+@@ -19,6 +19,7 @@
+ #include "rgw_aio.h"
+ #include "rgw_d3n_cacherequest.h"
+ #include "rgw_cache_driver.h"
++#include "rgw_tracer.h"
+ 
+ namespace rgw {
+ 
+@@ -54,11 +54,29 @@
+ Aio::OpFunc aio_abstract(librados::IoCtx ctx, Op&& op, jspan_context* trace_ctx = nullptr) {
+   return [ctx = std::move(ctx), op = std::forward<Op>(op), trace_ctx] (Aio* aio, AioResult& r) mutable {
+       constexpr bool read = std::is_same_v<std::decay_t<Op>, librados::ObjectReadOperation>;
++      // Wrap each per-chunk librados read in a rados_read span (mirrors
++      // the rados_write span in rgw_tools.cc). Without this, S3 GET data
++      // traces jump straight from rgw get_obj_data to OSD op-request-created.
++      jspan_ptr rados_span;
++      jspan_context child_ctx{false, false};
++      jspan_context *effective_trace_ctx = trace_ctx;
++      if constexpr (read) {
++        rados_span = tracing::rgw::tracer.add_span("rados_read",
++            trace_ctx ? *trace_ctx : jspan_context{false, false});
++        if (rados_span && rados_span->IsRecording()) {
++          rados_span->SetAttribute("oid", r.obj.oid);
++          rados_span->SetAttribute("pool", ctx.get_pool_name());
++          child_ctx = rados_span->GetContext();
++          if (child_ctx.IsValid()) effective_trace_ctx = &child_ctx;
++        }
++      }
+       // use placement new to construct the rados state inside of user_data
+       auto s = new (&r.user_data) state(aio, ctx, r);
+       if constexpr (read) {
+-        (void)trace_ctx; // suppress unused trace_ctx warning. until we will support the read op trace
+-        r.result = ctx.aio_operate(r.obj.oid, s->c, &op, &r.data);
++        // pass effective_trace_ctx via IoCtx::aio_operate ObjectReadOperation
++        // overload added by ceph-20.1.1-librados-read-trace.patch, so MOSDOp
++        // arrives at the OSD with a parent context.
++        r.result = ctx.aio_operate(r.obj.oid, s->c, &op, 0, &r.data, effective_trace_ctx);
+       } else {
+         r.result = ctx.aio_operate(r.obj.oid, s->c, &op, 0, trace_ctx);
+       }
+@@ -68,6 +86,11 @@
+         aio->put(r);
+         s->~state();
+       }
++      if constexpr (read) {
++        if (rados_span && rados_span->IsRecording()) {
++          rados_span->SetAttribute("submit_retval", r.result);
++        }
++      }
+     };
+ }
+ 
+@@ -93,12 +116,30 @@
+                          boost::asio::yield_context yield,
+                          jspan_context* trace_ctx) {
+   return [ctx = std::move(ctx), op = std::forward<Op>(op), yield, trace_ctx] (Aio* aio, AioResult& r) mutable {
++      constexpr bool read = std::is_same_v<std::decay_t<Op>, librados::ObjectReadOperation>;
++      // See companion aio_abstract above for the rationale.
++      jspan_ptr rados_span;
++      jspan_context child_ctx{false, false};
++      jspan_context *effective_trace_ctx = trace_ctx;
++      if constexpr (read) {
++        rados_span = tracing::rgw::tracer.add_span("rados_read",
++            trace_ctx ? *trace_ctx : jspan_context{false, false});
++        if (rados_span && rados_span->IsRecording()) {
++          rados_span->SetAttribute("oid", r.obj.oid);
++          rados_span->SetAttribute("pool", ctx.get_pool_name());
++          child_ctx = rados_span->GetContext();
++          if (child_ctx.IsValid()) effective_trace_ctx = &child_ctx;
++        }
++      }
+       // arrange for the completion Handler to run on the yield_context's strand
+       // executor so it can safely call back into Aio without locking
+       auto ex = yield.get_executor();
+ 
+-      librados::async_operate(ex, ctx, r.obj.oid, std::move(op), 0, trace_ctx,
++      librados::async_operate(ex, ctx, r.obj.oid, std::move(op), 0, effective_trace_ctx,
+                               bind_executor(ex, Handler{aio, ctx, r}));
++      // rados_span ends here (immediately after the librados call returns);
++      // duration is "time to enqueue", not full RTT. This matches the
++      // semantics of rados_write in rgw_tools.cc.
+     };
+ }
+ 
+-- 
+2.53.0
+
